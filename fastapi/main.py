@@ -1,6 +1,6 @@
 import base64
 import os
-from fastapi import FastAPI, UploadFile, File, Header, HTTPException
+from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi_mcp import FastApiMCP
 from openai import OpenAI
@@ -11,6 +11,10 @@ load_dotenv()
 app = FastAPI(title="AI Support Bot")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 SECRET_TOKEN = os.getenv("API_SECRET_TOKEN")
+def verify_token(authorization: str = Header(None)):
+    if authorization != f"Bearer {SECRET_TOKEN}":
+        raise HTTPException(status_code=401, detail="Nieautoryzowany dostep")
+    return True
 
 app.add_middleware(
     CORSMiddleware,
@@ -129,11 +133,8 @@ async def health():
 @app.post("/api/vision")
 async def analyze_image(
     file: UploadFile = File(...),
-    authorization: str = Header(None)
+    _: bool = Depends(verify_token)
 ):
-    if authorization != f"Bearer {SECRET_TOKEN}":
-        raise HTTPException(status_code=401, detail="Nieautoryzowany dostep")
-
     image_data = await file.read()
     image_base64 = base64.b64encode(image_data).decode("utf-8")
     mime_type = file.content_type if file.content_type else "image/jpeg"
@@ -195,7 +196,7 @@ class PostUpdate(BaseModel):
 # --- Narzędzia WordPress ---
 
 @app.get("/tools/list_posts")
-async def list_posts(per_page: int = 10):
+async def list_posts(per_page: int = 10, _: bool = Depends(verify_token)):
     """Pobiera listę ostatnich postów z WordPressa."""
     async with httpx.AsyncClient() as client:
         r = await client.get(
@@ -207,7 +208,7 @@ async def list_posts(per_page: int = 10):
 
 
 @app.post("/tools/create_post")
-async def create_post(post: PostCreate):
+async def create_post(post: PostCreate, _: bool = Depends(verify_token)):
     """Tworzy nowy post w WordPressie."""
     async with httpx.AsyncClient() as client:
         r = await client.post(
@@ -223,7 +224,7 @@ async def create_post(post: PostCreate):
 
 
 @app.post("/tools/update_post")
-async def update_post(post: PostUpdate):
+async def update_post(post: PostUpdate, _: bool = Depends(verify_token)):
     """Edytuje istniejący post w WordPressie."""
     payload = {k: v for k, v in post.dict().items() if v is not None and k != "post_id"}
     async with httpx.AsyncClient() as client:
@@ -236,7 +237,7 @@ async def update_post(post: PostUpdate):
 
 
 @app.delete("/tools/delete_post/{post_id}")
-async def delete_post(post_id: int):
+async def delete_post(post_id: int, _: bool = Depends(verify_token)):
     """Usuwa post z WordPressa (przenosi do kosza)."""
     async with httpx.AsyncClient() as client:
         r = await client.delete(
@@ -245,6 +246,113 @@ async def delete_post(post_id: int):
         )
     return {"status": r.status_code, "post_id": post_id}
 
+# ─── VISION TO POST ───────────────────────────────────────────
+
+import json
+from fastapi import Form
+
+VISION_TO_POST_PROMPT = """Przeanalizuj przesłany obraz i zwróć WYŁĄCZNIE obiekt JSON.
+Żadnego tekstu przed ani po — tylko czysty JSON.
+
+Struktura którą MUSISZ zwrócić:
+{
+  "title": "krótki, konkretny tytuł posta (max 10 słów)",
+  "content": "treść posta w HTML, minimum 3 akapity, użyj tagów <p>, <ul>, <li>, <strong>",
+  "tags": ["tag1", "tag2", "tag3"],
+  "excerpt": "jedno zdanie podsumowania (max 160 znaków)"
+}
+
+Język: polski. Ton: profesjonalny, pomocny."""
+
+
+@app.post("/api/vision-to-post")
+async def vision_to_post(
+    file: UploadFile = File(...),
+    status: str = Form("draft"),
+    _: bool = Depends(verify_token)
+):
+    """Analizuje zdjęcie przez GPT-4o i tworzy posta w WordPress."""
+
+    # 1. Walidacja pliku
+    if file.content_type not in ["image/jpeg", "image/png", "image/webp", "image/gif"]:
+        raise HTTPException(status_code=400, detail=f"Nieobsługiwany format pliku: {file.content_type}")
+
+    # 2. Odczyt i kodowanie obrazu
+    image_data = await file.read()
+
+    if len(image_data) > 20 * 1024 * 1024:  # 20MB limit
+        raise HTTPException(status_code=400, detail="Plik za duży. Maksymalny rozmiar to 20MB.")
+
+    image_base64 = base64.b64encode(image_data).decode("utf-8")
+    mime_type = file.content_type
+
+    # 3. Wywołanie GPT-4o z wymuszonym JSON
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},  # ← kluczowe: wymuszamy JSON
+        messages=[
+            {
+                "role": "system",
+                "content": VISION_TO_POST_PROMPT
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Przeanalizuj ten obraz i zwróć JSON zgodnie z instrukcją."
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{image_base64}"
+                        }
+                    }
+                ]
+            }
+        ],
+        max_tokens=2000
+    )
+
+    # 4. Parsowanie odpowiedzi
+    try:
+        post_data = json.loads(response.choices[0].message.content)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="GPT-4o zwrócił nieprawidłowy JSON.")
+
+    # 5. Zapis do WordPress przez istniejącą funkcję
+    async with httpx.AsyncClient() as http:
+        wp_response = await http.post(
+            f"{WP_URL}/posts",
+            json={
+                "title":   post_data.get("title", "Post bez tytułu"),
+                "content": post_data.get("content", ""),
+                "excerpt": post_data.get("excerpt", ""),
+                "status":  status
+            },
+            auth=(WP_USER, WP_APP_PASSWORD),
+            timeout=30.0
+        )
+
+    if wp_response.status_code not in [200, 201]:
+        raise HTTPException(
+            status_code=502,
+            detail=f"WordPress zwrócił błąd: {wp_response.status_code}"
+        )
+
+    wp_data = wp_response.json()
+
+    # 6. Odpowiedź do klienta
+    return {
+        "success": True,
+        "action": "vision_to_post",
+        "data": {
+            "post_id":  wp_data.get("id"),
+            "post_url": wp_data.get("link"),
+            "status":   status,
+            "preview":  post_data
+        }
+    }
 
 # ─── MCP SERVER ───────────────────────────────────────────────
 mcp = FastApiMCP(app)
