@@ -383,6 +383,13 @@ Format dla create_page:
 Format dla append_section:
 {"action":"append_section","page_slug":"slug-strony","section_html":"<section>...</section>"}
 
+Format dla update_content:
+{"action":"update_content","resource_type":"pages lub posts","resource_slug":"slug-zasobu","edit_instruction":"co dokladnie zmienic"}
+
+Przyklad dla update_content:
+- "przepisz strone o-nas profesjonalnie" -> resource_type: pages, resource_slug: o-nas
+- "przetlumacz post docker na angielski" -> resource_type: posts, resource_slug: docker
+
 Jezyk odpowiedzi: polski. Zwroc TYLKO JSON."""
 
 
@@ -489,6 +496,75 @@ async def text_command(
                 "message": f"Dodano sekcje do strony: {page_slug}",
                 "url": wp.get("link"),
                 "page_id": page_id
+            }}
+
+        elif action == "update_content":
+            # Pobieramy typ zasobu - strona czy post
+            resource_type = decision.get("resource_type", "pages")
+            resource_slug = decision.get("resource_slug", "")
+            edit_instruction = decision.get("edit_instruction", "")
+
+            # Krok 1: pobierz aktualna tresc z WordPress po slug
+            r = await http.get(
+                f"{WP_URL}/{resource_type}",
+                params={"slug": resource_slug, "context": "edit"},
+                auth=(WP_USER, WP_APP_PASSWORD),
+                timeout=30.0
+            )
+            resources = r.json()
+            if not resources or not isinstance(resources, list) or len(resources) == 0:
+                raise HTTPException(status_code=404, detail=f"Nie znaleziono zasobu: {resource_slug}")
+
+            resource    = resources[0]
+            resource_id = resource.get("id")
+            # Pobieramy surowy HTML bez shortcode WordPress
+            current_content = resource.get("content", {}).get("raw", "")
+            current_title   = resource.get("title", {}).get("rendered", "")
+
+            # Krok 2: wysylamy aktualna tresc + polecenie uzytkownika do LLM
+            edit_response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Jestes edytorem tresci WordPress. "
+                            "Otrzymasz aktualna tresc strony w HTML oraz instrukcje co zmienic. "
+                            "Zwroc TYLKO poprawiony HTML - bez komentarzy, bez markdown, bez wyjasnie. "
+                            "Zachowaj istniejace bloki Gutenberga jesli sa. "
+                            "Jezyk: polski."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Instrukcja: {edit_instruction}\n\n"
+                            f"Aktualna tresc:\n{current_content}"
+                        )
+                    }
+                ],
+                max_tokens=3000
+            )
+
+            new_content = edit_response.choices[0].message.content
+
+            # Krok 3: zapisz zaktualizowana tresc z powrotem do WordPress
+            r2 = await http.post(
+                f"{WP_URL}/{resource_type}/{resource_id}",
+                json={"content": new_content},
+                auth=(WP_USER, WP_APP_PASSWORD),
+                timeout=30.0
+            )
+            if r2.status_code not in [200, 201]:
+                raise HTTPException(status_code=502, detail=f"WordPress blad: {r2.status_code}")
+
+            wp = r2.json()
+            return {"success": True, "data": {
+                "action": "update_content",
+                "action_label": "Tresc zaktualizowana!",
+                "message": f"Zaktualizowano: {current_title}",
+                "url": wp.get("link"),
+                "resource_id": resource_id
             }}
 
         else:
