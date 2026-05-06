@@ -1,28 +1,45 @@
-# AI Bot Backend
+# AI WordPress Agent
 
-Backend API oparty o FastAPI z serwerem MCP, używany jako zaplecze dla integracji z WordPressem. Projekt umożliwia analizę obrazów przez Vision AI (GPT-4o) oraz bezpośrednie operacje na treści WordPress przez REST API.
+Autonomiczny agent AI oparty o FastAPI + GPT-4o, ktory rozumie polecenia w jezyku naturalnym i wykonuje operacje na WordPressie. Projekt sklada sie z backendu FastAPI oraz wtyczki WordPress (PHP).
 
 ## Architektura
 
 ```text
-Wtyczka WordPress (PHP)
+Uzytkownik (przeglądarka)
+        ↓
+Wtyczka WordPress v3.0 (PHP)
+  - formularz z 3 trybami
+  - proxy AJAX + autoryzacja Bearer Token
         ↓ HTTP + Bearer Token
 FastAPI Backend (port 8020)
-        ↓                    ↓
-GPT-4o Vision API     MCP Server (/mcp)
-        ↓                    ↓
-   Analiza obrazu    Narzędzia WordPress
-                          ↓
-                 WordPress REST API
-                 (przez sieć Docker)
+        ↓              ↓              ↓
+  /api/vision   /api/vision-to-post  /api/text-command
+  Analiza        Zdjecie → Post      Router intencji LLM
+  obrazu              ↓                     ↓
+                 GPT-4o Vision         GPT-4o decyduje
+                      ↓                co wykonac
+                 WordPress         create_post / create_page
+                 REST API          append_section / update_content
 ```
 
-## Co robi ten projekt
+## Co potrafi agent
 
-- Odbiera zdjęcia z wtyczki WordPress i analizuje je przez GPT-4o Vision
-- Specjalizuje się w diagnozowaniu problemów hostingowych CyberFolks
-- Udostępnia serwer MCP z narzędziami do zarządzania treścią WordPress
-- Autoryzuje żądania przez Bearer Token
+### Tryb 1 — Analiza zdjecia (wsparcie techniczne)
+Uzytkownik wgrywa screenshot bledu lub komunikat — GPT-4o analizuje i zwraca diagnoza techniczna (specjalizacja: hosting CyberFolks).
+
+### Tryb 2 — Zdjecie → Post WordPress
+Uzytkownik wgrywa zdjecie — GPT-4o Vision generuje tytul, tresc HTML, tagi i excerpt, MCP tworzy szkic posta w WordPress.
+
+### Tryb 3 — Polecenie tekstowe (agent AI)
+Uzytkownik wpisuje polecenie naturalnym jezykiem — LLM jako router intencji decyduje co wykonac:
+
+| Przyklad polecenia | Akcja |
+|---|---|
+| "Napisz post o Dockerze" | `create_post` |
+| "Utworz podstrone Portfolio" | `create_page` |
+| "Dodaj sekcje hero na stronie o-nas" | `append_section` |
+| "Przepisz strone o-nas profesjonalnie" | `update_content` |
+| "Dodaj animacje CSS do tej sekcji" | `update_content` |
 
 ## Endpointy
 
@@ -30,9 +47,11 @@ GPT-4o Vision API     MCP Server (/mcp)
 |---|---|---|
 | `/health` | GET | Status serwisu |
 | `/api/vision` | POST | Analiza obrazu przez GPT-4o |
-| `/tools/list_posts` | GET | Pobiera listę postów z WP |
+| `/api/vision-to-post` | POST | Zdjecie → szkic posta w WP |
+| `/api/text-command` | POST | Router intencji LLM → operacja na WP |
+| `/tools/list_posts` | GET | Pobiera liste postow z WP |
 | `/tools/create_post` | POST | Tworzy nowy post w WP |
-| `/tools/update_post` | POST | Edytuje istniejący post w WP |
+| `/tools/update_post` | POST | Edytuje istniejacy post w WP |
 | `/tools/delete_post/{id}` | DELETE | Usuwa post z WP |
 | `/mcp` | GET | Serwer MCP (SSE stream) |
 | `/docs` | GET | Swagger UI |
@@ -43,31 +62,37 @@ GPT-4o Vision API     MCP Server (/mcp)
 .
 ├── docker-compose.yml
 ├── .env                  ← nie jest w repo (secrets)
-├── .env.example          ← szablon zmiennych środowiskowych
+├── .env.example          ← szablon zmiennych srodowiskowych
 ├── README.md
 └── fastapi/
     ├── Dockerfile
-    ├── main.py
+    ├── main.py           ← caly backend: endpointy + router LLM
     └── requirements.txt
+```
+
+Wtyczka WordPress znajduje sie osobno w katalogu pluginow WP:
+```text
+wp-content/plugins/ai-support-bot/
+└── ai-support-bot.php   ← formularz + proxy PHP + JS
 ```
 
 ## Wymagania
 
 - Docker i Docker Compose
 - VPS z Ubuntu Server
-- WordPress z włączonym REST API i Application Passwords
+- WordPress z wlaczonym REST API i Application Passwords
 - Klucz API OpenAI (GPT-4o)
 
 ## Konfiguracja
 
-Utwórz plik `.env` na podstawie `.env.example`:
+Utworz plik `.env` na podstawie `.env.example`:
 
 ```bash
 cp .env.example .env
 nano .env
 ```
 
-Zmienne środowiskowe:
+Zmienne srodowiskowe:
 
 ```env
 API_SECRET_TOKEN=wygeneruj_przez_openssl_rand_hex_32
@@ -79,25 +104,25 @@ WP_URL=http://wordpress_app/wp-json/wp/v2
 
 ### WordPress Application Password
 
-1. Zaloguj się do WP Admin → Użytkownicy → Twój profil
-2. Zjedź do sekcji "Application Passwords"
-3. Wpisz nazwę `ai-bot` → kliknij "Add New Application Password"
-4. Skopiuj wygenerowane hasło do `.env`
+1. Zaloguj sie do WP Admin → Uzytkownicy → Twoj profil
+2. Zjed do sekcji "Application Passwords"
+3. Wpisz nazwe `ai-bot` → kliknij "Add New Application Password"
+4. Skopiuj wygenerowane haslo do `.env`
 
 ### Wymagana konfiguracja WordPress
 
-Dodaj do `wp-config.php` przed linią `/* That's all */`:
+Dodaj do `wp-config.php` przed linia `/* That's all */`:
 
 ```php
 define('WP_ENVIRONMENT_TYPE', 'local');
 ```
 
-Wymagane gdy WordPress działa przez HTTP (bez SSL) — np. w środowisku Docker.
+Wymagane gdy WordPress dziala przez HTTP (bez SSL) w srodowisku Docker.
 
 ## Uruchomienie
 
 ```bash
-# Sklonuj repo i wejdź do katalogu
+# Sklonuj repo
 git clone <repo-url>
 cd ai-bot
 
@@ -108,41 +133,61 @@ nano .env
 # Uruchom
 docker compose up -d --build
 
-# Sprawdź logi
-docker compose logs -f
+# Sprawdz logi
+docker compose logs -f fastapi
 ```
 
-## Sprawdź czy działa
+## Sprawdz czy dziala
 
 ```bash
 # Health check
-curl http://localhost:8020/health
+curl https://twoja-domena.duckdns.org/health
 
-# Test tworzenia posta
-curl -X POST http://localhost:8020/tools/create_post \
+# Test analizy zdjecia
+curl -X POST https://twoja-domena.duckdns.org/api/vision \
+  -H "Authorization: Bearer TWOJ_TOKEN" \
+  -F "file=@/tmp/screenshot.jpg"
+
+# Test polecenia tekstowego
+curl -X POST https://twoja-domena.duckdns.org/api/text-command \
+  -H "Authorization: Bearer TWOJ_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"title": "Test", "content": "Treść", "status": "draft"}'
+  -d '{"prompt": "Napisz post o bezpieczenstwie SSH"}'
 
-# MCP server
-curl http://localhost:8020/mcp
+# Test tworzenia posta ze zdjeciem
+curl -X POST https://twoja-domena.duckdns.org/api/vision-to-post \
+  -H "Authorization: Bearer TWOJ_TOKEN" \
+  -F "file=@/tmp/zdjecie.jpg" \
+  -F "status=draft"
 ```
 
-## Bezpieczeństwo
+## Bezpieczenstwo
 
-- Nie commituj `.env` do repozytorium
+- Nie commituj `.env` do repozytorium (jest w `.gitignore`)
 - Token API generuj przez `openssl rand -hex 32`
-- `WP_APP_PASSWORD` to hasło aplikacji WordPress — nie główne hasło admina
-- Jeśli sekret wycieknie, zmień go natychmiast w `.env` i `wp-config.php`
+- `WP_APP_PASSWORD` to haslo aplikacji WordPress — nie glowne haslo admina
+- Jesli sekret wycieknie — zmien go w `.env` i zrestartuj kontener
 
 ## Stack technologiczny
 
 - **FastAPI** — framework API (Python)
-- **fastapi-mcp** — serwer MCP eksponujący endpointy jako narzędzia AI
-- **OpenAI GPT-4o** — Vision API do analizy obrazów
+- **fastapi-mcp** — serwer MCP eksponujacy endpointy jako narzedzia AI
+- **OpenAI GPT-4o** — Vision API + router intencji LLM
 - **httpx** — async HTTP client do komunikacji z WordPress
-- **Docker Compose** — konteneryzacja i sieć między serwisami
+- **Docker Compose** — konteneryzacja i siec miedzy serwisami
 - **WordPress REST API** — backend CMS
+- **PHP/WordPress Plugin** — frontend agenta (shortcode `[ai_support_bot]`)
 
-## Status projektu
+## Roadmap
 
-Projekt w aktywnym rozwoju. Aktualnie zaimplementowane: Vision AI, MCP server, narzędzia CRUD dla postów WordPress.
+- [x] Vision AI — analiza zdjec
+- [x] Vision to Post — zdjecie generuje posta
+- [x] Text Command — router intencji LLM
+- [x] create_post — tworzenie postow
+- [x] create_page — tworzenie podstron
+- [x] append_section — dodawanie sekcji HTML+CSS
+- [x] update_content — edycja i stylowanie istniejacych tresci
+- [ ] upload_media — dodawanie zdjec do biblioteki WP
+- [ ] rate limiting — ochrona przed spamem
+- [ ] settings page — strona ustawien wtyczki
+- [ ] plugin distribution — wersja do dystrybucji (zip)
