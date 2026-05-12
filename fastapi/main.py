@@ -1,20 +1,29 @@
 import base64
 import os
-from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Depends
+import json
+import httpx
+from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Depends, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi_mcp import FastApiMCP
 from openai import OpenAI
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
 load_dotenv()
 
 app = FastAPI(title="AI Support Bot")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-SECRET_TOKEN = os.getenv("API_SECRET_TOKEN")
+SECRET_TOKEN    = os.getenv("API_SECRET_TOKEN")
+WP_URL          = os.getenv("WP_URL", "http://wordpress_app/wp-json/wp/v2")
+WP_USER         = os.getenv("WP_USER")
+WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD")
+
+
 def verify_token(authorization: str = Header(None)):
     if authorization != f"Bearer {SECRET_TOKEN}":
         raise HTTPException(status_code=401, detail="Nieautoryzowany dostep")
     return True
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,6 +32,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── STAN OSTATNIEJ AKCJI (w pamięci kontenera) ───────────────────────────────
+# Przechowuje info o ostatniej modyfikacji strony/posta — do operacji cofnięcia.
+# Uwaga: resetuje się przy restarcie kontenera.
+# Struktura:
+# {
+#   "type": "page",          ← "page" lub "post"
+#   "id": 42,                ← ID wpisu w WP
+#   "title": "Portfolio",    ← nazwa dla komunikatu
+#   "revision_id": 187,      ← ID rewizji sprzed akcji bota
+#   "action": "append_section",
+#   "timestamp": "2025-01-15T20:00:00"
+# }
+last_action_state: dict = {}
+
+
+# ── SYSTEM_PROMPT ────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = (
     "Jesteś zaawansowanym asystentem technicznym firmy CyberFolks – polskiego dostawcy usług hostingowych. "
     "Klient przesłał Ci zdjęcie (screenshot, zdjęcie ekranu, zwrotkę e-mail, komunikat błędu lub inny materiał wizualny). "
@@ -33,7 +58,7 @@ SYSTEM_PROMPT = (
     "- Serwery VPS zarządzane działają na panelu DirectAdmin z serwerem Apache.\\n"
     "- Panel klienta: https://panel.cyberfolks.pl\\n"
     "- Panel administracyjny (DirectAdmin): np. https://s135.cyber-folks.pl:2223\\n"
-    "- Webmail: https://poczta.cyberfolks.pl lub https://webmail.cyberfolks.pl\\n"
+    "- Webmail: [https://poczta.cyberfolks.pl](https://poczta.cyberfolks.pl) lub https://webmail.cyberfolks.pl\\n"
     "- Status usług: https://status.cyberfolks.pl\\n"
     "- Baza pomocy: https://cyberfolks.pl/pomoc\\n\\n"
 
@@ -125,78 +150,56 @@ SYSTEM_PROMPT = (
 )
 
 
+# ── HEALTH ───────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     return {"status": "running", "service": "ai-bot"}
 
 
+# ── VISION ───────────────────────────────────────────────────────────────────
 @app.post("/api/vision")
 async def analyze_image(
     file: UploadFile = File(...),
     _: bool = Depends(verify_token)
 ):
-    image_data = await file.read()
+    image_data   = await file.read()
     image_base64 = base64.b64encode(image_data).decode("utf-8")
-    mime_type = file.content_type if file.content_type else "image/jpeg"
+    mime_type    = file.content_type if file.content_type else "image/jpeg"
 
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT
-            },
+            {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": [
-                    {
-                        "type": "text",
-                        "text": "Przeanalizuj przesłane zdjęcie i odpowiedz zgodnie z instrukcjami."
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime_type};base64,{image_base64}"
-                        }
-                    }
+                    {"type": "text", "text": "Przeanalizuj przesłane zdjęcie i odpowiedz zgodnie z instrukcjami."},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_base64}"}}
                 ]
             }
         ],
         max_tokens=1500
     )
-
-    return {
-        "status": "ok",
-        "analysis": response.choices[0].message.content
-    }
+    return {"status": "ok", "analysis": response.choices[0].message.content}
 
 
-import httpx
-import json
-from pydantic import BaseModel
-from fastapi import Form
-
-WP_URL = os.getenv("WP_URL", "http://wordpress_app/wp-json/wp/v2")
-WP_USER = os.getenv("WP_USER")
-WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD")
-
-
-# --- Modele danych ---
-
+# ── MODELE DANYCH ─────────────────────────────────────────────────────────────
 class PostCreate(BaseModel):
-    title: str
+    title:   str
     content: str
-    status: str = "draft"
+    status:  str = "draft"
 
 class PostUpdate(BaseModel):
-    post_id: int
-    title: str = None
-    content: str = None
-    status: str = None
+    post_id:  int
+    title:    str = None
+    content:  str = None
+    status:   str = None
+
+class TextCommand(BaseModel):
+    prompt: str
 
 
-# --- Narzędzia WordPress ---
-
+# ── NARZĘDZIA WORDPRESS ───────────────────────────────────────────────────────
 @app.get("/tools/list_posts")
 async def list_posts(per_page: int = 10, _: bool = Depends(verify_token)):
     """Pobiera listę ostatnich postów z WordPressa."""
@@ -215,11 +218,7 @@ async def create_post(post: PostCreate, _: bool = Depends(verify_token)):
     async with httpx.AsyncClient() as http:
         r = await http.post(
             f"{WP_URL}/posts",
-            json={
-                "title": post.title,
-                "content": post.content,
-                "status": post.status
-            },
+            json={"title": post.title, "content": post.content, "status": post.status},
             auth=(WP_USER, WP_APP_PASSWORD)
         )
     return r.json()
@@ -249,8 +248,104 @@ async def delete_post(post_id: int, _: bool = Depends(verify_token)):
     return {"status": r.status_code, "post_id": post_id}
 
 
-# ─── VISION TO POST ───────────────────────────────────────────
+# ── REWIZJE ───────────────────────────────────────────────────────────────────
+@app.get("/tools/list_revisions/{post_type}/{post_id}")
+async def list_revisions(
+    post_type: str,   # "pages" lub "posts"
+    post_id:   int,
+    limit:     int = 10,
+    _: bool = Depends(verify_token)
+):
+    """Pobiera listę ostatnich rewizji danej strony lub posta."""
+    async with httpx.AsyncClient() as http:
+        resp = await http.get(
+            f"{WP_URL}/{post_type}/{post_id}/revisions",
+            params={"per_page": limit},
+            auth=(WP_USER, WP_APP_PASSWORD)
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
+    revisions = resp.json()
+    return {
+        "post_id":   post_id,
+        "post_type": post_type,
+        "revisions": [
+            {
+                "id":              r["id"],
+                "date":            r["date"],
+                "modified":        r.get("modified", ""),
+                "author":          r.get("author", 0),
+                "content_preview": r["content"]["rendered"][:100] if r.get("content") else ""
+            }
+            for r in revisions
+        ]
+    }
+
+
+@app.post("/api/undo-last")
+async def undo_last_action(_: bool = Depends(verify_token)):
+    """
+    Przywraca stronę/post do stanu SPRZED ostatniej akcji bota.
+    Działa tylko jeśli bot wykonał jakąś akcję w tej sesji kontenera.
+    """
+    global last_action_state
+
+    if not last_action_state:
+        return {
+            "success": False,
+            "message": "Brak zapisanego stanu do cofnięcia. Bot nie wykonał jeszcze żadnej akcji w tej sesji."
+        }
+
+    state     = last_action_state
+    post_type = "pages" if state["type"] == "page" else "posts"
+    post_id   = state["id"]
+    rev_id    = state["revision_id"]
+
+    async with httpx.AsyncClient() as http:
+
+        # Krok 1: Pobierz treść rewizji sprzed akcji bota
+        # context=edit zwraca surowy HTML (nie rendered), co jest potrzebne do zapisu
+        rev_resp = await http.get(
+            f"{WP_URL}/{post_type}/{post_id}/revisions/{rev_id}",
+            params={"context": "edit"},
+            auth=(WP_USER, WP_APP_PASSWORD)
+        )
+        if rev_resp.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Nie mogę pobrać rewizji {rev_id}: {rev_resp.text}"
+            )
+
+        revision_data = rev_resp.json()
+        old_content   = revision_data["content"]["raw"]
+        old_title     = revision_data["title"]["raw"]
+
+        # Krok 2: Zapisz starą treść jako nową aktualną wersję
+        restore_resp = await http.post(
+            f"{WP_URL}/{post_type}/{post_id}",
+            json={"title": old_title, "content": old_content, "status": "publish"},
+            auth=(WP_USER, WP_APP_PASSWORD)
+        )
+        if restore_resp.status_code not in (200, 201):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Nie mogę przywrócić treści: {restore_resp.text}"
+            )
+
+    performed_action  = state["action"]
+    target_title      = state["title"]
+    last_action_state = {}   # wyczyść — nie można cofnąć dwa razy z rzędu
+
+    return {
+        "success": True,
+        "message": f"✅ Cofnięto akcję '{performed_action}' na '{target_title}'. Treść przywrócona do stanu sprzed działania bota.",
+        "restored_from_revision": rev_id,
+        "note": "Stan wyczyszczony — kolejne 'cofnij' nie jest możliwe bez nowej akcji."
+    }
+
+
+# ── VISION TO POST ────────────────────────────────────────────────────────────
 VISION_TO_POST_PROMPT = """Przeanalizuj przesłany obraz i zwróć WYŁĄCZNIE obiekt JSON.
 Żadnego tekstu przed ani po — tylko czysty JSON.
 
@@ -267,44 +362,31 @@ Język: polski. Ton: profesjonalny, pomocny."""
 
 @app.post("/api/vision-to-post")
 async def vision_to_post(
-    file: UploadFile = File(...),
-    status: str = Form("draft"),
+    file:   UploadFile = File(...),
+    status: str        = Form("draft"),
     _: bool = Depends(verify_token)
 ):
     """Analizuje zdjęcie przez GPT-4o i tworzy posta w WordPress."""
-
     if file.content_type not in ["image/jpeg", "image/png", "image/webp", "image/gif"]:
         raise HTTPException(status_code=400, detail=f"Nieobsługiwany format pliku: {file.content_type}")
 
     image_data = await file.read()
-
     if len(image_data) > 20 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Plik za duży. Maksymalny rozmiar to 20MB.")
 
     image_base64 = base64.b64encode(image_data).decode("utf-8")
-    mime_type = file.content_type
+    mime_type    = file.content_type
 
     response = client.chat.completions.create(
         model="gpt-4o",
         response_format={"type": "json_object"},
         messages=[
-            {
-                "role": "system",
-                "content": VISION_TO_POST_PROMPT
-            },
+            {"role": "system", "content": VISION_TO_POST_PROMPT},
             {
                 "role": "user",
                 "content": [
-                    {
-                        "type": "text",
-                        "text": "Przeanalizuj ten obraz i zwróć JSON zgodnie z instrukcją."
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime_type};base64,{image_base64}"
-                        }
-                    }
+                    {"type": "text", "text": "Przeanalizuj ten obraz i zwróć JSON zgodnie z instrukcją."},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_base64}"}}
                 ]
             }
         ],
@@ -330,16 +412,12 @@ async def vision_to_post(
         )
 
     if wp_response.status_code not in [200, 201]:
-        raise HTTPException(
-            status_code=502,
-            detail=f"WordPress zwrócił błąd: {wp_response.status_code}"
-        )
+        raise HTTPException(status_code=502, detail=f"WordPress zwrócił błąd: {wp_response.status_code}")
 
     wp_data = wp_response.json()
-
     return {
         "success": True,
-        "action": "vision_to_post",
+        "action":  "vision_to_post",
         "data": {
             "post_id":  wp_data.get("id"),
             "post_url": wp_data.get("link"),
@@ -349,19 +427,12 @@ async def vision_to_post(
     }
 
 
-# ─── MCP SERVER ───────────────────────────────────────────────
+# ── MCP SERVER ────────────────────────────────────────────────────────────────
 mcp = FastApiMCP(app)
 mcp.mount()
 
 
-# ─── TEXT COMMAND ─────────────────────────────────────────────
-
-from pydantic import BaseModel as _BaseModel
-
-class TextCommand(_BaseModel):
-    prompt: str
-
-
+# ── PROMPTY AGENTA ────────────────────────────────────────────────────────────
 WEBMASTER_PROMPT = """
 Jesteś profesjonalnym webmasterem i web designerem z 10-letnim doświadczeniem,
 specjalizującym się w WordPress. Tworzysz nowoczesne, w pełni responsywne
@@ -490,6 +561,38 @@ Zwróć TYLKO JSON. Zero tekstu przed ani po.
 """
 
 
+# ── FUNKCJA POMOCNICZA: zapis stanu przed modyfikacją ────────────────────────
+async def _save_state_before_action(
+    http:       httpx.AsyncClient,
+    post_type:  str,   # "pages" lub "posts"
+    post_id:    int,
+    post_title: str,
+    action:     str
+):
+    """
+    Pobiera ID najnowszej rewizji i zapisuje ją w last_action_state.
+    Wywołuj PRZED każdym zapisem do WP — wtedy masz rewizję "sprzed bota".
+    """
+    global last_action_state
+    rev_resp = await http.get(
+        f"{WP_URL}/{post_type}/{post_id}/revisions",
+        params={"per_page": 1},
+        auth=(WP_USER, WP_APP_PASSWORD)
+    )
+    if rev_resp.status_code == 200:
+        revisions = rev_resp.json()
+        if revisions:
+            last_action_state = {
+                "type":        "page" if post_type == "pages" else "post",
+                "id":          post_id,
+                "title":       post_title,
+                "revision_id": revisions[0]["id"],
+                "action":      action,
+                "timestamp":   revisions[0]["date"]
+            }
+
+
+# ── TEXT COMMAND ──────────────────────────────────────────────────────────────
 @app.post("/api/text-command")
 async def text_command(
     command: TextCommand,
@@ -514,6 +617,7 @@ async def text_command(
 
     async with httpx.AsyncClient() as http:
 
+        # ── create_post ───────────────────────────────────────────────────────
         if action == "create_post":
             r = await http.post(
                 f"{WP_URL}/posts",
@@ -530,13 +634,14 @@ async def text_command(
                 raise HTTPException(status_code=502, detail=f"WordPress blad: {r.status_code}")
             wp = r.json()
             return {"success": True, "data": {
-                "action": "create_post",
+                "action":       "create_post",
                 "action_label": "Post utworzony!",
-                "message": f"Utworzono szkic: {decision.get('title')}",
-                "url": wp.get("link"),
-                "post_id": wp.get("id")
+                "message":      f"Utworzono szkic: {decision.get('title')}",
+                "url":          wp.get("link"),
+                "post_id":      wp.get("id")
             }}
 
+        # ── create_page ───────────────────────────────────────────────────────
         elif action == "create_page":
             r = await http.post(
                 f"{WP_URL}/pages",
@@ -553,20 +658,21 @@ async def text_command(
                 raise HTTPException(status_code=502, detail=f"WordPress blad: {r.status_code}")
             wp = r.json()
             return {"success": True, "data": {
-                "action": "create_page",
+                "action":       "create_page",
                 "action_label": "Podstrona utworzona!",
-                "message": f"Utworzono podstronę: {decision.get('title')}",
-                "url": wp.get("link"),
-                "page_id": wp.get("id")
+                "message":      f"Utworzono podstronę: {decision.get('title')}",
+                "url":          wp.get("link"),
+                "page_id":      wp.get("id")
             }}
 
+        # ── append_section ────────────────────────────────────────────────────
         elif action == "append_section":
             page_slug   = decision.get("page_slug", "")
             design_desc = decision.get("design_description", "")
             position    = decision.get("position", "bottom")
 
-            # Krok 1: WEBMASTER generuje HTML na podstawie opisu
-            design_resp = client.chat.completions.create(
+            # Krok 1: WEBMASTER generuje HTML
+            design_resp  = client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
                     {"role": "system", "content": WEBMASTER_PROMPT},
@@ -589,14 +695,14 @@ async def text_command(
 
             page            = pages[0]
             page_id         = page.get("id")
+            page_title      = page.get("title", {}).get("rendered", page_slug)
             current_content = page.get("content", {}).get("raw", "")
-            new_block       = f'\n<!-- wp:html -->\n{section_html}\n<!-- /wp:html -->'
 
-            # Krok 3: top lub bottom
-            if position == "top":
-                updated_content = new_block + "\n" + current_content
-            else:
-                updated_content = current_content + new_block
+            # Krok 3: Zapisz stan PRZED modyfikacją (do cofnięcia)
+            await _save_state_before_action(http, "pages", page_id, page_title, "append_section")
+
+            new_block = f'\n<!-- wp:html -->\n{section_html}\n<!-- /wp:html -->'
+            updated_content = (new_block + "\n" + current_content) if position == "top" else (current_content + new_block)
 
             r2 = await http.post(
                 f"{WP_URL}/pages/{page_id}",
@@ -608,19 +714,19 @@ async def text_command(
                 raise HTTPException(status_code=502, detail=f"WordPress blad: {r2.status_code}")
             wp = r2.json()
             return {"success": True, "data": {
-                "action": "append_section",
+                "action":       "append_section",
                 "action_label": "Sekcja dodana!",
-                "message": f"Zaprojektowano i dodano sekcję do strony '{page_slug}' ({position}).",
-                "url": wp.get("link"),
-                "page_id": page_id
+                "message":      f"Zaprojektowano i dodano sekcję do strony '{page_slug}' ({position}). Możesz cofnąć tę zmianę przez /api/undo-last",
+                "url":          wp.get("link"),
+                "page_id":      page_id
             }}
 
+        # ── design_section ────────────────────────────────────────────────────
         elif action == "design_section":
             description = decision.get("description", "")
             page_slug   = decision.get("page_slug")
 
-            # Webmaster generuje czysty HTML
-            design_resp = client.chat.completions.create(
+            design_resp    = client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
                     {"role": "system", "content": WEBMASTER_PROMPT},
@@ -630,7 +736,6 @@ async def text_command(
             )
             generated_html = design_resp.choices[0].message.content.strip()
 
-            # Jeśli podano stronę — dołącz do niej
             if page_slug:
                 r = await http.get(
                     f"{WP_URL}/pages",
@@ -641,9 +746,15 @@ async def text_command(
                 pages = r.json()
                 if not pages:
                     raise HTTPException(status_code=404, detail=f"Strona '{page_slug}' nie istnieje.")
+
                 page_id         = pages[0]["id"]
+                page_title      = pages[0].get("title", {}).get("rendered", page_slug)
                 current_content = pages[0]["content"]["raw"]
-                new_block       = f'\n<!-- wp:html -->\n{generated_html}\n<!-- /wp:html -->'
+
+                # Zapisz stan PRZED modyfikacją
+                await _save_state_before_action(http, "pages", page_id, page_title, "design_section")
+
+                new_block = f'\n<!-- wp:html -->\n{generated_html}\n<!-- /wp:html -->'
                 r2 = await http.post(
                     f"{WP_URL}/pages/{page_id}",
                     json={"content": current_content + new_block},
@@ -652,20 +763,20 @@ async def text_command(
                 )
                 wp = r2.json()
                 return {"success": True, "data": {
-                    "action": "design_section",
+                    "action":       "design_section",
                     "action_label": "Sekcja zaprojektowana i dodana!",
-                    "message": f"Sekcja dodana do strony '{page_slug}'.",
-                    "url": wp.get("link")
+                    "message":      f"Sekcja dodana do strony '{page_slug}'. Możesz cofnąć tę zmianę przez /api/undo-last",
+                    "url":          wp.get("link")
                 }}
 
-            # Jeśli nie podano strony — zwróć sam HTML
             return {"success": True, "data": {
-                "action": "design_section",
-                "action_label": "Projekt gotowy!",
-                "message": "Nie podano strony docelowej — zwracam wygenerowany HTML.",
+                "action":         "design_section",
+                "action_label":   "Projekt gotowy!",
+                "message":        "Nie podano strony docelowej — zwracam wygenerowany HTML.",
                 "generated_html": generated_html
             }}
 
+        # ── update_content ────────────────────────────────────────────────────
         elif action == "update_content":
             resource_type    = decision.get("resource_type", "pages")
             resource_slug    = decision.get("resource_slug", "")
@@ -686,6 +797,9 @@ async def text_command(
             current_content = resource.get("content", {}).get("raw", "")
             current_title   = resource.get("title", {}).get("rendered", "")
 
+            # Zapisz stan PRZED modyfikacją
+            await _save_state_before_action(http, resource_type, resource_id, current_title, "update_content")
+
             edit_response = client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
@@ -701,15 +815,11 @@ async def text_command(
                     },
                     {
                         "role": "user",
-                        "content": (
-                            f"Instrukcja: {edit_instruction}\n\n"
-                            f"Aktualna treść:\n{current_content}"
-                        )
+                        "content": f"Instrukcja: {edit_instruction}\n\nAktualna treść:\n{current_content}"
                     }
                 ],
                 max_tokens=3000
             )
-
             new_content = edit_response.choices[0].message.content
 
             r2 = await http.post(
@@ -723,13 +833,14 @@ async def text_command(
 
             wp = r2.json()
             return {"success": True, "data": {
-                "action": "update_content",
+                "action":       "update_content",
                 "action_label": "Treść zaktualizowana!",
-                "message": f"Zaktualizowano: {current_title}",
-                "url": wp.get("link"),
-                "resource_id": resource_id
+                "message":      f"Zaktualizowano: {current_title}. Możesz cofnąć tę zmianę przez /api/undo-last",
+                "url":          wp.get("link"),
+                "resource_id":  resource_id
             }}
 
+        # ── delete_content ────────────────────────────────────────────────────
         elif action == "delete_content":
             resource_type = decision.get("resource_type", "pages")
             resource_slug = decision.get("resource_slug", "")
@@ -748,7 +859,6 @@ async def text_command(
             item_id = items[0]["id"]
 
             if mode == "clear_content":
-                # Bezpieczny tryb: tylko czyści treść, nie usuwa strony/posta
                 await http.post(
                     f"{WP_URL}/{resource_type}/{item_id}",
                     json={"content": ""},
@@ -756,29 +866,29 @@ async def text_command(
                     timeout=30.0
                 )
                 return {"success": True, "data": {
-                    "action": "delete_content",
+                    "action":       "delete_content",
                     "action_label": "Treść wyczyszczona",
-                    "message": f"Wyczyszczono treść: {resource_slug} (strona/post nadal istnieje)."
+                    "message":      f"Wyczyszczono treść: {resource_slug} (strona/post nadal istnieje)."
                 }}
             else:
-                # Tryb delete: przenosi do kosza WP
                 await http.delete(
                     f"{WP_URL}/{resource_type}/{item_id}",
                     auth=(WP_USER, WP_APP_PASSWORD),
                     timeout=30.0
                 )
                 return {"success": True, "data": {
-                    "action": "delete_content",
+                    "action":       "delete_content",
                     "action_label": "Usunięto!",
-                    "message": f"Przeniesiono do kosza: {resource_slug}."
+                    "message":      f"Przeniesiono do kosza: {resource_slug}."
                 }}
 
+        # ── unknown ───────────────────────────────────────────────────────────
         elif action == "unknown":
             return {"success": False, "data": {
-                "action": "unknown",
+                "action":       "unknown",
                 "action_label": "Nie rozumiem polecenia",
-                "message": decision.get("reason", "Polecenie niezrozumiałe."),
-                "suggestion": decision.get("suggestion", "Spróbuj sformułować polecenie bardziej precyzyjnie.")
+                "message":      decision.get("reason", "Polecenie niezrozumiałe."),
+                "suggestion":   decision.get("suggestion", "Spróbuj sformułować polecenie bardziej precyzyjnie.")
             }}
 
         else:
