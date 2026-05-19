@@ -1,7 +1,9 @@
 import base64
 import os
 import json
+import uuid
 import httpx
+from datetime import datetime, timedelta
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Depends, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi_mcp import FastApiMCP
@@ -18,6 +20,11 @@ WP_URL          = os.getenv("WP_URL", "http://wordpress_app/wp-json/wp/v2")
 WP_USER         = os.getenv("WP_USER")
 WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD")
 
+WC_URL  = os.getenv("WC_URL")
+WC_AUTH = (os.getenv("WP_USER"), os.getenv("WP_APP_PASSWORD"))
+# ── KONFIGURACJA ──────────────────────────────────────────────────────────────
+PENDING_EXPIRY_MINUTES = 20   # po tym czasie token podglądu wygasa
+
 
 def verify_token(authorization: str = Header(None)):
     if authorization != f"Bearer {SECRET_TOKEN}":
@@ -32,22 +39,63 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── STAN OSTATNIEJ AKCJI (w pamięci kontenera) ───────────────────────────────
-# Przechowuje info o ostatniej modyfikacji strony/posta — do operacji cofnięcia.
-# Uwaga: resetuje się przy restarcie kontenera.
+# ── STAN OSTATNIEJ AKCJI (cofnij) ─────────────────────────────────────────────
 # Struktura:
-# {
-#   "type": "page",          ← "page" lub "post"
-#   "id": 42,                ← ID wpisu w WP
-#   "title": "Portfolio",    ← nazwa dla komunikatu
-#   "revision_id": 187,      ← ID rewizji sprzed akcji bota
-#   "action": "append_section",
-#   "timestamp": "2025-01-15T20:00:00"
-# }
+# { "type": "page"|"post", "id": int, "title": str,
+#   "revision_id": int, "action": str, "timestamp": str }
 last_action_state: dict = {}
 
+# ── OCZEKUJĄCE AKCJE (podgląd przed zatwierdzeniem) ───────────────────────────
+# token (UUID str) → dane akcji gotowej do wykonania
+# Struktura wspólna:
+# { "action": str, "created_at": datetime, "preview_html": str, ...pola specyficzne }
+pending_actions: dict = {}
 
-# ── SYSTEM_PROMPT ────────────────────────────────────────────────────────────
+
+# ── HELPERY ───────────────────────────────────────────────────────────────────
+
+def _cleanup_expired_pending():
+    """Usuwa tokeny podglądu, które przekroczyły PENDING_EXPIRY_MINUTES."""
+    now = datetime.utcnow()
+    expired = [
+        t for t, d in list(pending_actions.items())
+        if now - d.get("created_at", now) > timedelta(minutes=PENDING_EXPIRY_MINUTES)
+    ]
+    for t in expired:
+        del pending_actions[t]
+
+
+def _delete_warning_html(resource_slug: str, resource_type: str, mode: str) -> str:
+    """Generuje ostrzegawczy HTML do podglądu dla operacji usuwania."""
+    type_label   = "stronę" if resource_type == "pages" else "post"
+    action_label = (
+        "Treść zostanie <strong>wyczyszczona</strong> (strona/post pozostanie w WordPress)"
+        if mode == "clear_content"
+        else "Strona/post zostanie <strong>przeniesiona do kosza</strong>"
+    )
+    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>
+  body {{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+         background:#fff5f5;margin:0;padding:2rem;box-sizing:border-box;}}
+  .box {{background:white;border:2px solid #dc2626;border-radius:12px;
+         padding:1.5rem 2rem;max-width:520px;}}
+  h2  {{color:#dc2626;margin-top:0;font-size:1.2rem;}}
+  .slug{{background:#fee2e2;padding:0.25rem 0.8rem;border-radius:6px;
+         font-family:monospace;color:#991b1b;font-size:0.95rem;}}
+  p   {{color:#374151;line-height:1.6;}}
+  .warn{{color:#dc2626;font-weight:700;}}
+</style></head><body>
+  <div class="box">
+    <h2>⚠️ Potwierdzenie operacji usuwania</h2>
+    <p>Zamierzasz usunąć {type_label}:</p>
+    <p><span class="slug">{resource_slug}</span></p>
+    <p class="warn">{action_label}.</p>
+    <p>Kliknij <strong>Zatwierdź i zapisz</strong> poniżej, aby potwierdzić.</p>
+  </div>
+</body></html>"""
+
+
+# ── SYSTEM_PROMPT ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = (
     "Jesteś zaawansowanym asystentem technicznym firmy CyberFolks – polskiego dostawcy usług hostingowych. "
     "Klient przesłał Ci zdjęcie (screenshot, zdjęcie ekranu, zwrotkę e-mail, komunikat błędu lub inny materiał wizualny). "
@@ -150,13 +198,13 @@ SYSTEM_PROMPT = (
 )
 
 
-# ── HEALTH ───────────────────────────────────────────────────────────────────
+# ── HEALTH ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     return {"status": "running", "service": "ai-bot"}
 
 
-# ── VISION ───────────────────────────────────────────────────────────────────
+# ── VISION ────────────────────────────────────────────────────────────────────
 @app.post("/api/vision")
 async def analyze_image(
     file: UploadFile = File(...),
@@ -183,7 +231,7 @@ async def analyze_image(
     return {"status": "ok", "analysis": response.choices[0].message.content}
 
 
-# ── MODELE DANYCH ─────────────────────────────────────────────────────────────
+# ── MODELE DANYCH ──────────────────────────────────────────────────────────────
 class PostCreate(BaseModel):
     title:   str
     content: str
@@ -198,8 +246,21 @@ class PostUpdate(BaseModel):
 class TextCommand(BaseModel):
     prompt: str
 
+class ActionToken(BaseModel):
+    token: str
 
-# ── NARZĘDZIA WORDPRESS ───────────────────────────────────────────────────────
+class ProductCreate(BaseModel):
+    name: str
+    type: str = "simple"          # simple, variable, grouped
+    regular_price: str            # WC wymaga string, np. "49.99"
+    description: str = ""
+    short_description: str = ""
+    status: str = "publish"       # publish, draft, pending
+    sku: str = ""
+    stock_quantity: int | None = None
+    manage_stock: bool = False
+
+# ── NARZĘDZIA WORDPRESS ────────────────────────────────────────────────────────
 @app.get("/tools/list_posts")
 async def list_posts(per_page: int = 10, _: bool = Depends(verify_token)):
     """Pobiera listę ostatnich postów z WordPressa."""
@@ -247,11 +308,57 @@ async def delete_post(post_id: int, _: bool = Depends(verify_token)):
         )
     return {"status": r.status_code, "post_id": post_id}
 
+@app.post("/products")
+async def create_product(product: ProductCreate, token: str = Depends(verify_token)):
+    """Tworzy nowy produkt w WooCommerce."""
+    payload = product.model_dump(exclude_none=True)
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{WC_URL}/products",
+            json=payload,
+            auth=WC_AUTH,   # Basic Auth: (user, hasło)
+            timeout=30.0
+        )
+    
+    if response.status_code not in (200, 201):
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"WooCommerce error: {response.text}"
+        )
+    
+    data = response.json()
+    return {
+        "id": data["id"],
+        "name": data["name"],
+        "status": data["status"],
+        "permalink": data.get("permalink", ""),
+        "price": data.get("regular_price", "")
+    }
 
-# ── REWIZJE ───────────────────────────────────────────────────────────────────
+@app.delete("/products/{product_id}")
+async def delete_product(product_id: int, token: str = Depends(verify_token)):
+    """Usuwa produkt z WooCommerce. force=True = permanentnie (pomija kosz)."""
+    async with httpx.AsyncClient() as client:
+        response = await client.delete(
+            f"{WC_URL}/products/{product_id}",
+            params={"force": True},  # bez tego WC tylko przenosi do kosza
+            auth=WC_AUTH,
+            timeout=30.0
+        )
+    
+    if response.status_code not in (200, 201):
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"WooCommerce error: {response.text}"
+        )
+    
+    return {"message": f"Produkt {product_id} usunięty.", "deleted": True}
+
+# ── REWIZJE ────────────────────────────────────────────────────────────────────
 @app.get("/tools/list_revisions/{post_type}/{post_id}")
 async def list_revisions(
-    post_type: str,   # "pages" lub "posts"
+    post_type: str,
     post_id:   int,
     limit:     int = 10,
     _: bool = Depends(verify_token)
@@ -283,12 +390,10 @@ async def list_revisions(
     }
 
 
+# ── COFNIJ OSTATNIĄ AKCJĘ ─────────────────────────────────────────────────────
 @app.post("/api/undo-last")
 async def undo_last_action(_: bool = Depends(verify_token)):
-    """
-    Przywraca stronę/post do stanu SPRZED ostatniej akcji bota.
-    Działa tylko jeśli bot wykonał jakąś akcję w tej sesji kontenera.
-    """
+    """Przywraca stronę/post do stanu SPRZED ostatniej akcji bota."""
     global last_action_state
 
     if not last_action_state:
@@ -303,9 +408,6 @@ async def undo_last_action(_: bool = Depends(verify_token)):
     rev_id    = state["revision_id"]
 
     async with httpx.AsyncClient() as http:
-
-        # Krok 1: Pobierz treść rewizji sprzed akcji bota
-        # context=edit zwraca surowy HTML (nie rendered), co jest potrzebne do zapisu
         rev_resp = await http.get(
             f"{WP_URL}/{post_type}/{post_id}/revisions/{rev_id}",
             params={"context": "edit"},
@@ -321,7 +423,6 @@ async def undo_last_action(_: bool = Depends(verify_token)):
         old_content   = revision_data["content"]["raw"]
         old_title     = revision_data["title"]["raw"]
 
-        # Krok 2: Zapisz starą treść jako nową aktualną wersję
         restore_resp = await http.post(
             f"{WP_URL}/{post_type}/{post_id}",
             json={"title": old_title, "content": old_content, "status": "publish"},
@@ -335,7 +436,7 @@ async def undo_last_action(_: bool = Depends(verify_token)):
 
     performed_action  = state["action"]
     target_title      = state["title"]
-    last_action_state = {}   # wyczyść — nie można cofnąć dwa razy z rzędu
+    last_action_state = {}
 
     return {
         "success": True,
@@ -345,7 +446,7 @@ async def undo_last_action(_: bool = Depends(verify_token)):
     }
 
 
-# ── VISION TO POST ────────────────────────────────────────────────────────────
+# ── VISION TO POST ─────────────────────────────────────────────────────────────
 VISION_TO_POST_PROMPT = """Przeanalizuj przesłany obraz i zwróć WYŁĄCZNIE obiekt JSON.
 Żadnego tekstu przed ani po — tylko czysty JSON.
 
@@ -427,12 +528,12 @@ async def vision_to_post(
     }
 
 
-# ── MCP SERVER ────────────────────────────────────────────────────────────────
+# ── MCP SERVER ─────────────────────────────────────────────────────────────────
 mcp = FastApiMCP(app)
 mcp.mount()
 
 
-# ── PROMPTY AGENTA ────────────────────────────────────────────────────────────
+# ── PROMPTY AGENTA ─────────────────────────────────────────────────────────────
 WEBMASTER_PROMPT = """
 Jesteś profesjonalnym webmasterem i web designerem z 10-letnim doświadczeniem,
 specjalizującym się w WordPress. Tworzysz nowoczesne, w pełni responsywne
@@ -525,9 +626,18 @@ i zwracasz WYŁĄCZNIE jeden obiekt JSON - zero tekstu poza nim.
    Kiedy: "usuń stronę", "skasuj post", "wyczyść treść strony X"
    {"action":"delete_content","resource_type":"pages lub posts","resource_slug":"slug","mode":"delete lub clear_content"}
 
-7. unknown
+7. create_product
+   Kiedy: "dodaj produkt", "utwórz produkt", "stwórz produkt w sklepie"
+   {"action":"create_product","name":"nazwa","regular_price":"29.99","description":"opis","status":"draft"}
+
+8. delete_product
+   Kiedy: "usuń produkt", "skasuj produkt", "usuń produkt o nazwie X", "usuń produkt ID X"
+   Gdy użytkownik podaje nazwę: {"action":"delete_product","name":"Koszulka czarna"}
+   Gdy użytkownik podaje ID:    {"action":"delete_product","product_id":123}
+
+9. unknown
    Kiedy: polecenie jest niezrozumiałe, zbyt ogólne lub nie dotyczy zarządzania stroną WP.
-   {"action":"unknown","reason":"krótkie wyjaśnienie po polsku czego brakuje","suggestion":"co użytkownik powinien doprecyzować"}
+   {"action":"unknown","reason":"krótkie wyjaśnienie po polsku czego brakuje","suggestion":"co użytkownik powinien doprecyzować}
 
 === ZASADY WYBORU AKCJI ===
 - Jeśli polecenie zawiera "strona X" + "dodaj/dopisz" -> append_section (nie design_section)
@@ -561,17 +671,17 @@ Zwróć TYLKO JSON. Zero tekstu przed ani po.
 """
 
 
-# ── FUNKCJA POMOCNICZA: zapis stanu przed modyfikacją ────────────────────────
+# ── FUNKCJA POMOCNICZA: zapis stanu przed modyfikacją ─────────────────────────
 async def _save_state_before_action(
     http:       httpx.AsyncClient,
-    post_type:  str,   # "pages" lub "posts"
+    post_type:  str,
     post_id:    int,
     post_title: str,
     action:     str
 ):
     """
     Pobiera ID najnowszej rewizji i zapisuje ją w last_action_state.
-    Wywołuj PRZED każdym zapisem do WP — wtedy masz rewizję "sprzed bota".
+    Wywołuj PRZED każdym zapisem do WP.
     """
     global last_action_state
     rev_resp = await http.get(
@@ -592,12 +702,147 @@ async def _save_state_before_action(
             }
 
 
-# ── TEXT COMMAND ──────────────────────────────────────────────────────────────
+# ── POTWIERDŹ PODGLĄD → ZAPISZ DO WP ─────────────────────────────────────────
+@app.post("/api/confirm-action")
+async def confirm_action(body: ActionToken, _: bool = Depends(verify_token)):
+    """
+    Wykonuje akcję, której podgląd użytkownik wcześniej zatwierdził.
+    Token jest jednorazowy — po użyciu zostaje usunięty.
+    """
+    _cleanup_expired_pending()
+    token = body.token
+
+    if token not in pending_actions:
+        raise HTTPException(
+            status_code=404,
+            detail="Token wygasł lub jest nieważny. Wygeneruj podgląd ponownie."
+        )
+
+    # Pobierz i od razu usuń token — zapobiega podwójnemu zatwierdzeniu
+    state  = pending_actions.pop(token)
+    action = state["action"]
+
+    async with httpx.AsyncClient() as http:
+
+        # ── append_section lub design_section (z page_slug) ──────────────────
+        if action in ("append_section", "design_section"):
+            page_id         = state["page_id"]
+            page_title      = state["page_title"]
+            page_slug       = state["page_slug"]
+            current_content = state["current_content"]
+            section_html    = state["section_html"]
+            position        = state.get("position", "bottom")
+
+            await _save_state_before_action(http, "pages", page_id, page_title, action)
+
+            new_block = f'\n<!-- wp:html -->\n{section_html}\n<!-- /wp:html -->'
+            updated_content = (
+                new_block + "\n" + current_content
+                if position == "top"
+                else current_content + new_block
+            )
+
+            r = await http.post(
+                f"{WP_URL}/pages/{page_id}",
+                json={"content": updated_content},
+                auth=(WP_USER, WP_APP_PASSWORD),
+                timeout=30.0
+            )
+            if r.status_code not in [200, 201]:
+                raise HTTPException(status_code=502, detail=f"WordPress błąd: {r.status_code}")
+
+            wp = r.json()
+            return {"success": True, "data": {
+                "action":       action,
+                "action_label": "Sekcja dodana!",
+                "message":      f"✅ Sekcja została dodana do strony '{page_slug}'. Możesz cofnąć przez przycisk Cofnij.",
+                "url":          wp.get("link"),
+                "page_id":      page_id
+            }}
+
+        # ── update_content ────────────────────────────────────────────────────
+        elif action == "update_content":
+            resource_type = state["resource_type"]
+            resource_id   = state["resource_id"]
+            resource_slug = state.get("resource_slug", "")
+            current_title = state.get("current_title", resource_slug)
+            new_content   = state["new_content"]
+
+            await _save_state_before_action(http, resource_type, resource_id, current_title, "update_content")
+
+            r = await http.post(
+                f"{WP_URL}/{resource_type}/{resource_id}",
+                json={"content": new_content},
+                auth=(WP_USER, WP_APP_PASSWORD),
+                timeout=30.0
+            )
+            if r.status_code not in [200, 201]:
+                raise HTTPException(status_code=502, detail=f"WordPress błąd: {r.status_code}")
+
+            wp = r.json()
+            return {"success": True, "data": {
+                "action":       "update_content",
+                "action_label": "Treść zaktualizowana!",
+                "message":      f"✅ Zaktualizowano: {current_title}. Możesz cofnąć przez przycisk Cofnij.",
+                "url":          wp.get("link"),
+                "resource_id":  resource_id
+            }}
+
+        # ── delete_content ────────────────────────────────────────────────────
+        elif action == "delete_content":
+            resource_type = state["resource_type"]
+            resource_slug = state["resource_slug"]
+            item_id       = state["item_id"]
+            mode          = state["mode"]
+
+            if mode == "clear_content":
+                await http.post(
+                    f"{WP_URL}/{resource_type}/{item_id}",
+                    json={"content": ""},
+                    auth=(WP_USER, WP_APP_PASSWORD),
+                    timeout=30.0
+                )
+                return {"success": True, "data": {
+                    "action":       "delete_content",
+                    "action_label": "Treść wyczyszczona",
+                    "message":      f"✅ Wyczyszczono treść: {resource_slug} (strona/post nadal istnieje)."
+                }}
+            else:
+                await http.delete(
+                    f"{WP_URL}/{resource_type}/{item_id}",
+                    auth=(WP_USER, WP_APP_PASSWORD),
+                    timeout=30.0
+                )
+                return {"success": True, "data": {
+                    "action":       "delete_content",
+                    "action_label": "Usunięto!",
+                    "message":      f"✅ Przeniesiono do kosza: {resource_slug}."
+                }}
+
+    raise HTTPException(status_code=400, detail=f"Nieznana akcja w pending: {action}")
+
+
+# ── ODRZUĆ PODGLĄD ─────────────────────────────────────────────────────────────
+@app.post("/api/discard-action")
+async def discard_action(body: ActionToken, _: bool = Depends(verify_token)):
+    """Usuwa token oczekującej akcji — nic nie jest zapisywane do WP."""
+    token     = body.token
+    discarded = pending_actions.pop(token, None)
+    action    = discarded["action"] if discarded else "nieznana"
+    return {
+        "success": True,
+        "message": f"Akcja '{action}' została odrzucona. Żadne zmiany nie zostały zapisane."
+    }
+
+
+# ── TEXT COMMAND ───────────────────────────────────────────────────────────────
 @app.post("/api/text-command")
 async def text_command(
     command: TextCommand,
     _: bool = Depends(verify_token)
 ):
+    _cleanup_expired_pending()
+
     router_response = client.chat.completions.create(
         model="gpt-4o",
         response_format={"type": "json_object"},
@@ -617,7 +862,7 @@ async def text_command(
 
     async with httpx.AsyncClient() as http:
 
-        # ── create_post ───────────────────────────────────────────────────────
+        # ── create_post — bez podglądu (tworzy szkic) ─────────────────────────
         if action == "create_post":
             r = await http.post(
                 f"{WP_URL}/posts",
@@ -641,7 +886,7 @@ async def text_command(
                 "post_id":      wp.get("id")
             }}
 
-        # ── create_page ───────────────────────────────────────────────────────
+        # ── create_page — bez podglądu (tworzy szkic) ─────────────────────────
         elif action == "create_page":
             r = await http.post(
                 f"{WP_URL}/pages",
@@ -665,7 +910,7 @@ async def text_command(
                 "page_id":      wp.get("id")
             }}
 
-        # ── append_section ────────────────────────────────────────────────────
+        # ── append_section — PODGLĄD przed zapisem ────────────────────────────
         elif action == "append_section":
             page_slug   = decision.get("page_slug", "")
             design_desc = decision.get("design_description", "")
@@ -698,27 +943,28 @@ async def text_command(
             page_title      = page.get("title", {}).get("rendered", page_slug)
             current_content = page.get("content", {}).get("raw", "")
 
-            # Krok 3: Zapisz stan PRZED modyfikacją (do cofnięcia)
-            await _save_state_before_action(http, "pages", page_id, page_title, "append_section")
+            # Krok 3: Zapisz jako pending — NIE piszemy do WP
+            token = str(uuid.uuid4())
+            pending_actions[token] = {
+                "action":          "append_section",
+                "created_at":      datetime.utcnow(),
+                "page_id":         page_id,
+                "page_slug":       page_slug,
+                "page_title":      page_title,
+                "current_content": current_content,
+                "section_html":    section_html,
+                "position":        position,
+            }
 
-            new_block = f'\n<!-- wp:html -->\n{section_html}\n<!-- /wp:html -->'
-            updated_content = (new_block + "\n" + current_content) if position == "top" else (current_content + new_block)
-
-            r2 = await http.post(
-                f"{WP_URL}/pages/{page_id}",
-                json={"content": updated_content},
-                auth=(WP_USER, WP_APP_PASSWORD),
-                timeout=30.0
-            )
-            if r2.status_code not in [200, 201]:
-                raise HTTPException(status_code=502, detail=f"WordPress blad: {r2.status_code}")
-            wp = r2.json()
             return {"success": True, "data": {
-                "action":       "append_section",
-                "action_label": "Sekcja dodana!",
-                "message":      f"Zaprojektowano i dodano sekcję do strony '{page_slug}' ({position}). Możesz cofnąć tę zmianę przez /api/undo-last",
-                "url":          wp.get("link"),
-                "page_id":      page_id
+                "preview":       True,
+                "pending_token": token,
+                "preview_html":  section_html,
+                "action":        "append_section",
+                "action_label":  "Podgląd sekcji gotowy",
+                "message":       f"Wygenerowano podgląd sekcji dla strony '{page_title}'. Zatwierdź, aby zapisać zmiany.",
+                "page_title":    page_title,
+                "expires_in":    PENDING_EXPIRY_MINUTES * 60
             }}
 
         # ── design_section ────────────────────────────────────────────────────
@@ -736,47 +982,54 @@ async def text_command(
             )
             generated_html = design_resp.choices[0].message.content.strip()
 
-            if page_slug:
-                r = await http.get(
-                    f"{WP_URL}/pages",
-                    params={"slug": page_slug, "context": "edit"},
-                    auth=(WP_USER, WP_APP_PASSWORD),
-                    timeout=30.0
-                )
-                pages = r.json()
-                if not pages:
-                    raise HTTPException(status_code=404, detail=f"Strona '{page_slug}' nie istnieje.")
-
-                page_id         = pages[0]["id"]
-                page_title      = pages[0].get("title", {}).get("rendered", page_slug)
-                current_content = pages[0]["content"]["raw"]
-
-                # Zapisz stan PRZED modyfikacją
-                await _save_state_before_action(http, "pages", page_id, page_title, "design_section")
-
-                new_block = f'\n<!-- wp:html -->\n{generated_html}\n<!-- /wp:html -->'
-                r2 = await http.post(
-                    f"{WP_URL}/pages/{page_id}",
-                    json={"content": current_content + new_block},
-                    auth=(WP_USER, WP_APP_PASSWORD),
-                    timeout=30.0
-                )
-                wp = r2.json()
+            # Bez strony docelowej — zwróć HTML bezpośrednio (bez podglądu/pending)
+            if not page_slug:
                 return {"success": True, "data": {
-                    "action":       "design_section",
-                    "action_label": "Sekcja zaprojektowana i dodana!",
-                    "message":      f"Sekcja dodana do strony '{page_slug}'. Możesz cofnąć tę zmianę przez /api/undo-last",
-                    "url":          wp.get("link")
+                    "action":         "design_section",
+                    "action_label":   "Projekt gotowy!",
+                    "message":        "Nie podano strony docelowej — zwracam wygenerowany HTML.",
+                    "generated_html": generated_html
                 }}
 
+            # Ze stroną docelową — PODGLĄD przed zapisem
+            r = await http.get(
+                f"{WP_URL}/pages",
+                params={"slug": page_slug, "context": "edit"},
+                auth=(WP_USER, WP_APP_PASSWORD),
+                timeout=30.0
+            )
+            pages = r.json()
+            if not pages:
+                raise HTTPException(status_code=404, detail=f"Strona '{page_slug}' nie istnieje.")
+
+            page_id         = pages[0]["id"]
+            page_title      = pages[0].get("title", {}).get("rendered", page_slug)
+            current_content = pages[0]["content"]["raw"]
+
+            token = str(uuid.uuid4())
+            pending_actions[token] = {
+                "action":          "design_section",
+                "created_at":      datetime.utcnow(),
+                "page_id":         page_id,
+                "page_slug":       page_slug,
+                "page_title":      page_title,
+                "current_content": current_content,
+                "section_html":    generated_html,
+                "position":        "bottom",
+            }
+
             return {"success": True, "data": {
-                "action":         "design_section",
-                "action_label":   "Projekt gotowy!",
-                "message":        "Nie podano strony docelowej — zwracam wygenerowany HTML.",
-                "generated_html": generated_html
+                "preview":       True,
+                "pending_token": token,
+                "preview_html":  generated_html,
+                "action":        "design_section",
+                "action_label":  "Podgląd projektu gotowy",
+                "message": f"Wygenerowano podgląd sekcji dla strony '{page_title}'. Zatwierdź, aby dodać.",
+                "page_title":    page_title,
+                "expires_in":    PENDING_EXPIRY_MINUTES * 60
             }}
 
-        # ── update_content ────────────────────────────────────────────────────
+        # ── update_content — PODGLĄD przed zapisem ────────────────────────────
         elif action == "update_content":
             resource_type    = decision.get("resource_type", "pages")
             resource_slug    = decision.get("resource_slug", "")
@@ -797,9 +1050,7 @@ async def text_command(
             current_content = resource.get("content", {}).get("raw", "")
             current_title   = resource.get("title", {}).get("rendered", "")
 
-            # Zapisz stan PRZED modyfikacją
-            await _save_state_before_action(http, resource_type, resource_id, current_title, "update_content")
-
+            # LLM generuje nową treść
             edit_response = client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
@@ -822,25 +1073,30 @@ async def text_command(
             )
             new_content = edit_response.choices[0].message.content
 
-            r2 = await http.post(
-                f"{WP_URL}/{resource_type}/{resource_id}",
-                json={"content": new_content},
-                auth=(WP_USER, WP_APP_PASSWORD),
-                timeout=30.0
-            )
-            if r2.status_code not in [200, 201]:
-                raise HTTPException(status_code=502, detail=f"WordPress blad: {r2.status_code}")
+            # Zapisz jako pending — NIE piszemy do WP
+            token = str(uuid.uuid4())
+            pending_actions[token] = {
+                "action":        "update_content",
+                "created_at":    datetime.utcnow(),
+                "resource_type": resource_type,
+                "resource_id":   resource_id,
+                "resource_slug": resource_slug,
+                "current_title": current_title,
+                "new_content":   new_content,
+            }
 
-            wp = r2.json()
             return {"success": True, "data": {
-                "action":       "update_content",
-                "action_label": "Treść zaktualizowana!",
-                "message":      f"Zaktualizowano: {current_title}. Możesz cofnąć tę zmianę przez /api/undo-last",
-                "url":          wp.get("link"),
-                "resource_id":  resource_id
+                "preview":       True,
+                "pending_token": token,
+                "preview_html":  new_content,
+                "action":        "update_content",
+                "action_label":  "Podgląd edycji gotowy",
+               	"message": f"Wygenerowano podgląd zmian dla '{current_title}'. Zatwierdź, aby zapisać.",
+	        "page_title":    current_title,
+                "expires_in":    PENDING_EXPIRY_MINUTES * 60
             }}
 
-        # ── delete_content ────────────────────────────────────────────────────
+        # ── delete_content — PODGLĄD (ostrzeżenie) przed usunięciem ──────────
         elif action == "delete_content":
             resource_type = decision.get("resource_type", "pages")
             resource_slug = decision.get("resource_slug", "")
@@ -858,29 +1114,26 @@ async def text_command(
 
             item_id = items[0]["id"]
 
-            if mode == "clear_content":
-                await http.post(
-                    f"{WP_URL}/{resource_type}/{item_id}",
-                    json={"content": ""},
-                    auth=(WP_USER, WP_APP_PASSWORD),
-                    timeout=30.0
-                )
-                return {"success": True, "data": {
-                    "action":       "delete_content",
-                    "action_label": "Treść wyczyszczona",
-                    "message":      f"Wyczyszczono treść: {resource_slug} (strona/post nadal istnieje)."
-                }}
-            else:
-                await http.delete(
-                    f"{WP_URL}/{resource_type}/{item_id}",
-                    auth=(WP_USER, WP_APP_PASSWORD),
-                    timeout=30.0
-                )
-                return {"success": True, "data": {
-                    "action":       "delete_content",
-                    "action_label": "Usunięto!",
-                    "message":      f"Przeniesiono do kosza: {resource_slug}."
-                }}
+            warning_html = _delete_warning_html(resource_slug, resource_type, mode)
+            token = str(uuid.uuid4())
+            pending_actions[token] = {
+                "action":        "delete_content",
+                "created_at":    datetime.utcnow(),
+                "resource_type": resource_type,
+                "resource_slug": resource_slug,
+                "item_id":       item_id,
+                "mode":          mode,
+            }
+
+            return {"success": True, "data": {
+                "preview":       True,
+                "pending_token": token,
+                "preview_html":  warning_html,
+                "action":        "delete_content",
+                "action_label":  "⚠️ Potwierdzenie usunięcia",
+                "message":       f"Zamierzasz usunąć: {resource_slug}. Sprawdź szczegóły i zatwierdź.",
+                "expires_in":    PENDING_EXPIRY_MINUTES * 60
+            }}
 
         # ── unknown ───────────────────────────────────────────────────────────
         elif action == "unknown":
@@ -891,5 +1144,70 @@ async def text_command(
                 "suggestion":   decision.get("suggestion", "Spróbuj sformułować polecenie bardziej precyzyjnie.")
             }}
 
+        
+        # ── create_product — WooCommerce ──────────────────────────────────────
+        elif action == "create_product":
+            async with httpx.AsyncClient() as http:
+                r = await http.post(
+                    f"{WC_URL}/products",
+                    json={
+                        "name":          decision.get("name", "Nowy produkt"),
+                        "regular_price": str(decision.get("regular_price", "0")),
+                        "description":   decision.get("description", ""),
+                        "status":        decision.get("status", "draft"),
+                        "type":          "simple"
+                    },
+                    auth=WC_AUTH,
+                    timeout=30.0
+                )
+            if r.status_code not in (200, 201):
+                raise HTTPException(status_code=502, detail=f"WooCommerce błąd: {r.text}")
+            wc = r.json()
+            return {"success": True, "data": {
+                "action":       "create_product",
+                "action_label": "Produkt utworzony!",
+                "message":      f"✅ Dodano produkt: {wc.get('name')} (ID: {wc.get('id')}) — cena: {wc.get('regular_price')} zł",
+                "url":          wc.get("permalink", ""),
+                "post_id":      wc.get("id")
+            }}
+
+        # ── delete_product — WooCommerce ──────────────────────────────────────
+        elif action == "delete_product":
+            product_id   = decision.get("product_id")
+            product_name = decision.get("name", "")
+
+            if not product_id and product_name:
+                async with httpx.AsyncClient() as http:
+                    search = await http.get(
+                        f"{WC_URL}/products",
+                        params={"search": product_name, "per_page": 5},
+                        auth=WC_AUTH,
+                        timeout=30.0
+                    )
+                results = search.json()
+                if not results:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Nie znaleziono produktu '{product_name}'"
+                    )
+                product_id = results[0]["id"]
+
+            if not product_id:
+                raise HTTPException(status_code=400, detail="Podaj ID lub nazwę produktu.")
+
+            async with httpx.AsyncClient() as http:
+                r = await http.delete(
+                    f"{WC_URL}/products/{product_id}",
+                    params={"force": True},
+                    auth=WC_AUTH,
+                    timeout=30.0
+                )
+            if r.status_code not in (200, 201):
+                raise HTTPException(status_code=502, detail=f"WooCommerce błąd: {r.text}")
+            return {"success": True, "data": {
+                "action":       "delete_product",
+                "action_label": "Produkt usunięty!",
+                "message":      f"✅ Produkt '{product_name or product_id}' (ID: {product_id}) został trwale usunięty."
+            }}
         else:
             raise HTTPException(status_code=400, detail=f"Nieznana akcja: {action}")
