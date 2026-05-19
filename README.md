@@ -1,45 +1,62 @@
 # AI WordPress Agent
 
-Autonomiczny agent AI oparty o FastAPI + GPT-4o, ktory rozumie polecenia w jezyku naturalnym i wykonuje operacje na WordPressie. Projekt sklada sie z backendu FastAPI oraz wtyczki WordPress (PHP).
+Autonomiczny agent AI oparty o FastAPI + GPT-4o, który rozumie polecenia w języku naturalnym i wykonuje operacje na WordPressie — z systemem podglądu przed zapisem. Projekt składa się z backendu FastAPI oraz wtyczki WordPress (PHP).
 
 ## Architektura
 
 ```text
-Uzytkownik (przeglądarka)
+Użytkownik (przeglądarka)
         ↓
-Wtyczka WordPress v3.0 (PHP)
-  - formularz z 3 trybami
+Wtyczka WordPress v5.0 (PHP)
+  - panel admina z 3 trybami
   - proxy AJAX + autoryzacja Bearer Token
+  - system podglądu z przyciskami Zatwierdź/Odrzuć
         ↓ HTTP + Bearer Token
 FastAPI Backend (port 8020)
-        ↓              ↓              ↓
-  /api/vision   /api/vision-to-post  /api/text-command
-  Analiza        Zdjecie → Post      Router intencji LLM
-  obrazu              ↓                     ↓
-                 GPT-4o Vision         GPT-4o decyduje
-                      ↓                co wykonac
-                 WordPress         create_post / create_page
-                 REST API          append_section / update_content
+        ↓                    ↓                      ↓
+  /api/vision        /api/vision-to-post     /api/text-command
+  Analiza obrazu     Zdjęcie → Post WP       Router intencji LLM
+                                                      ↓
+                                              GPT-4o decyduje
+                                              co wykonać
+                                                      ↓
+                                         pending_actions (podgląd)
+                                                      ↓
+                                    /api/confirm-action | /api/discard-action
+                                                      ↓
+                                             WordPress REST API
 ```
 
 ## Co potrafi agent
 
-### Tryb 1 — Analiza zdjecia (wsparcie techniczne)
-Uzytkownik wgrywa screenshot bledu lub komunikat — GPT-4o analizuje i zwraca diagnoza techniczna (specjalizacja: hosting CyberFolks).
+### Tryb 1 — Analiza zdjęcia (wsparcie techniczne)
+Użytkownik wgrywa screenshot błędu lub komunikat — GPT-4o analizuje i zwraca diagnozę techniczną (specjalizacja: hosting CyberFolks).
 
-### Tryb 2 — Zdjecie → Post WordPress
-Uzytkownik wgrywa zdjecie — GPT-4o Vision generuje tytul, tresc HTML, tagi i excerpt, MCP tworzy szkic posta w WordPress.
+### Tryb 2 — Zdjęcie → Post WordPress
+Użytkownik wgrywa zdjęcie — GPT-4o Vision generuje tytuł, treść HTML, tagi i excerpt, tworzy szkic posta w WordPress.
 
-### Tryb 3 — Polecenie tekstowe (agent AI)
-Uzytkownik wpisuje polecenie naturalnym jezykiem — LLM jako router intencji decyduje co wykonac:
+### Tryb 3 — Polecenie tekstowe (agent AI z podglądem)
+Użytkownik wpisuje polecenie naturalnym językiem — LLM jako router intencji decyduje co wykonać. Przed każdą zmianą agent generuje **podgląd wizualny** i czeka na zatwierdzenie.
 
-| Przyklad polecenia | Akcja |
-|---|---|
-| "Napisz post o Dockerze" | `create_post` |
-| "Utworz podstrone Portfolio" | `create_page` |
-| "Dodaj sekcje hero na stronie o-nas" | `append_section` |
-| "Przepisz strone o-nas profesjonalnie" | `update_content` |
-| "Dodaj animacje CSS do tej sekcji" | `update_content` |
+| Przykład polecenia | Akcja | Podgląd |
+|---|---|---|
+| `Napisz post o Dockerze` | `create_post` | Wygenerowany HTML posta |
+| `Utwórz podstronę Portfolio` | `create_page` | HTML nowej strony |
+| `Dodaj sekcję hero na stronie o-nas` | `append_section` | Wizualny podgląd sekcji |
+| `Przepisz stronę o-nas profesjonalnie` | `update_content` | Pełny HTML po zmianie |
+| `Przenieś sekcję X nad sekcję Y` | `move_section` | Strona z nową kolejnością |
+| `Usuń sekcję kontakt ze strony X` | `delete_section` | Strona po usunięciu |
+| `Zamień miejscami sekcje A i B` | `swap_sections` | Strona po zamianie |
+
+## System podglądu (Pending Actions)
+
+Każda operacja modyfikująca treść WordPress przechodzi przez system podglądu:
+
+1. Agent oblicza zmiany i generuje `preview_html`
+2. Wtyczka wyświetla podgląd wizualny w panelu admina
+3. Użytkownik klika **Zatwierdź i zapisz** lub **Odrzuć zmiany**
+4. Podgląd wygasa automatycznie po 20 minutach
+5. Cofnięcie ostatniej akcji dostępne przez przycisk **Cofnij**
 
 ## Endpointy
 
@@ -47,11 +64,14 @@ Uzytkownik wpisuje polecenie naturalnym jezykiem — LLM jako router intencji de
 |---|---|---|
 | `/health` | GET | Status serwisu |
 | `/api/vision` | POST | Analiza obrazu przez GPT-4o |
-| `/api/vision-to-post` | POST | Zdjecie → szkic posta w WP |
-| `/api/text-command` | POST | Router intencji LLM → operacja na WP |
-| `/tools/list_posts` | GET | Pobiera liste postow z WP |
+| `/api/vision-to-post` | POST | Zdjęcie → szkic posta w WP |
+| `/api/text-command` | POST | Router intencji LLM → podgląd operacji |
+| `/api/confirm-action` | POST | Zatwierdź i zapisz do WordPress |
+| `/api/discard-action` | POST | Odrzuć podgląd bez zapisu |
+| `/api/undo-last` | POST | Cofnij ostatnią zatwierdzoną akcję |
+| `/tools/list_posts` | GET | Pobiera listę postów z WP |
 | `/tools/create_post` | POST | Tworzy nowy post w WP |
-| `/tools/update_post` | POST | Edytuje istniejacy post w WP |
+| `/tools/update_post` | POST | Edytuje istniejący post w WP |
 | `/tools/delete_post/{id}` | DELETE | Usuwa post z WP |
 | `/mcp` | GET | Serwer MCP (SSE stream) |
 | `/docs` | GET | Swagger UI |
@@ -62,37 +82,37 @@ Uzytkownik wpisuje polecenie naturalnym jezykiem — LLM jako router intencji de
 .
 ├── docker-compose.yml
 ├── .env                  ← nie jest w repo (secrets)
-├── .env.example          ← szablon zmiennych srodowiskowych
+├── .env.example          ← szablon zmiennych środowiskowych
 ├── README.md
 └── fastapi/
     ├── Dockerfile
-    ├── main.py           ← caly backend: endpointy + router LLM
+    ├── main.py           ← cały backend: endpointy + router LLM + pending actions
     └── requirements.txt
 ```
 
-Wtyczka WordPress znajduje sie osobno w katalogu pluginow WP:
+Wtyczka WordPress znajduje się osobno w katalogu pluginów WP:
 ```text
 wp-content/plugins/ai-support-bot/
-└── ai-support-bot.php   ← formularz + proxy PHP + JS
+└── ai-support-bot.php   ← panel admina + proxy PHP + JS z systemem podglądu
 ```
 
 ## Wymagania
 
 - Docker i Docker Compose
 - VPS z Ubuntu Server
-- WordPress z wlaczonym REST API i Application Passwords
+- WordPress z włączonym REST API i Application Passwords
 - Klucz API OpenAI (GPT-4o)
 
 ## Konfiguracja
 
-Utworz plik `.env` na podstawie `.env.example`:
+Utwórz plik `.env` na podstawie `.env.example`:
 
 ```bash
 cp .env.example .env
 nano .env
 ```
 
-Zmienne srodowiskowe:
+Zmienne środowiskowe:
 
 ```env
 API_SECRET_TOKEN=wygeneruj_przez_openssl_rand_hex_32
@@ -104,20 +124,20 @@ WP_URL=http://wordpress_app/wp-json/wp/v2
 
 ### WordPress Application Password
 
-1. Zaloguj sie do WP Admin → Uzytkownicy → Twoj profil
-2. Zjed do sekcji "Application Passwords"
-3. Wpisz nazwe `ai-bot` → kliknij "Add New Application Password"
-4. Skopiuj wygenerowane haslo do `.env`
+1. Zaloguj się do WP Admin → Użytkownicy → Twój profil
+2. Zejdź do sekcji "Application Passwords"
+3. Wpisz nazwę `ai-bot` → kliknij "Add New Application Password"
+4. Skopiuj wygenerowane hasło do `.env`
 
 ### Wymagana konfiguracja WordPress
 
-Dodaj do `wp-config.php` przed linia `/* That's all */`:
+Dodaj do `wp-config.php` przed linią `/* That's all */`:
 
 ```php
 define('WP_ENVIRONMENT_TYPE', 'local');
 ```
 
-Wymagane gdy WordPress dziala przez HTTP (bez SSL) w srodowisku Docker.
+Wymagane gdy WordPress działa przez HTTP (bez SSL) w środowisku Docker.
 
 ## Uruchomienie
 
@@ -133,61 +153,59 @@ nano .env
 # Uruchom
 docker compose up -d --build
 
-# Sprawdz logi
+# Sprawdź logi
 docker compose logs -f fastapi
 ```
 
-## Sprawdz czy dziala
+## Sprawdź czy działa
 
 ```bash
 # Health check
 curl https://twoja-domena.duckdns.org/health
 
-# Test analizy zdjecia
-curl -X POST https://twoja-domena.duckdns.org/api/vision \
-  -H "Authorization: Bearer TWOJ_TOKEN" \
-  -F "file=@/tmp/screenshot.jpg"
-
 # Test polecenia tekstowego
 curl -X POST https://twoja-domena.duckdns.org/api/text-command \
   -H "Authorization: Bearer TWOJ_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "Napisz post o bezpieczenstwie SSH"}'
+  -d '{"prompt": "Dodaj sekcję hero na stronę o-nas"}'
 
-# Test tworzenia posta ze zdjeciem
-curl -X POST https://twoja-domena.duckdns.org/api/vision-to-post \
+# Test analizy zdjęcia
+curl -X POST https://twoja-domena.duckdns.org/api/vision \
   -H "Authorization: Bearer TWOJ_TOKEN" \
-  -F "file=@/tmp/zdjecie.jpg" \
-  -F "status=draft"
+  -F "file=@/tmp/screenshot.jpg"
 ```
 
-## Bezpieczenstwo
+## Bezpieczeństwo
 
 - Nie commituj `.env` do repozytorium (jest w `.gitignore`)
 - Token API generuj przez `openssl rand -hex 32`
-- `WP_APP_PASSWORD` to haslo aplikacji WordPress — nie glowne haslo admina
-- Jesli sekret wycieknie — zmien go w `.env` i zrestartuj kontener
+- `WP_APP_PASSWORD` to hasło aplikacji WordPress — nie główne hasło admina
+- Jeśli sekret wycieknie — zmień go w `.env` i zrestartuj kontener
+- Panel agenta dostępny tylko dla zalogowanych adminów WP (`manage_options`)
 
 ## Stack technologiczny
 
 - **FastAPI** — framework API (Python)
-- **fastapi-mcp** — serwer MCP eksponujacy endpointy jako narzedzia AI
-- **OpenAI GPT-4o** — Vision API + router intencji LLM
+- **fastapi-mcp** — serwer MCP eksponujący endpointy jako narzędzia AI
+- **OpenAI GPT-4o** — Vision API + router intencji LLM + generowanie HTML
 - **httpx** — async HTTP client do komunikacji z WordPress
-- **Docker Compose** — konteneryzacja i siec miedzy serwisami
+- **Docker Compose** — konteneryzacja i sieć między serwisami
 - **WordPress REST API** — backend CMS
-- **PHP/WordPress Plugin** — frontend agenta (shortcode `[ai_support_bot]`)
+- **PHP/WordPress Plugin v5.0** — panel admina z systemem podglądu
 
 ## Roadmap
 
-- [x] Vision AI — analiza zdjec
-- [x] Vision to Post — zdjecie generuje posta
+- [x] Vision AI — analiza zdjęć
+- [x] Vision to Post — zdjęcie generuje posta
 - [x] Text Command — router intencji LLM
-- [x] create_post — tworzenie postow
-- [x] create_page — tworzenie podstron
+- [x] create_post / create_page — tworzenie treści
 - [x] append_section — dodawanie sekcji HTML+CSS
-- [x] update_content — edycja i stylowanie istniejacych tresci
-- [ ] upload_media — dodawanie zdjec do biblioteki WP
+- [x] update_content — edycja istniejących treści
+- [x] move_section / delete_section / swap_sections — zarządzanie sekcjami
+- [x] System podglądu (pending actions) — zatwierdź/odrzuć przed zapisem
+- [x] Cofnij ostatnią akcję (undo)
+- [x] Countdown wygasania podglądu
+- [ ] upload_media — dodawanie zdjęć do biblioteki WP
 - [ ] rate limiting — ochrona przed spamem
-- [ ] settings page — strona ustawien wtyczki
+- [ ] settings page — strona ustawień wtyczki w WP Admin
 - [ ] plugin distribution — wersja do dystrybucji (zip)
