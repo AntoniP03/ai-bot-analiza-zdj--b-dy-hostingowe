@@ -3,7 +3,6 @@ import os
 import json
 import uuid
 import re
-import secrets
 import httpx
 from datetime import datetime, timedelta
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Depends, Form
@@ -95,19 +94,6 @@ def _delete_warning_html(resource_slug: str, resource_type: str, mode: str) -> s
     <p>Kliknij <strong>Zatwierdź i zapisz</strong> poniżej, aby potwierdzić.</p>
   </div>
 </body></html>"""
-
-def _find_section_idx(sections: list[dict], label: str):
-    """Znajdź sekcję po etykiecie — toleruje spacje zamiast myślników."""
-    # Dokładne dopasowanie
-    for i, s in enumerate(sections):
-        if s["label"] == label:
-            return i
-    # Fuzzy: zamień spacje na myślniki i odwrotnie
-    normalized = label.lower().replace(" ", "-").replace("_", "-")
-    for i, s in enumerate(sections):
-        if s["label"].replace(" ", "-") == normalized:
-            return i
-    return None
 
 def _parse_sections(raw_content: str) -> list[dict]:
     """
@@ -724,22 +710,6 @@ i zwracasz WYŁĄCZNIE jeden obiekt JSON - zero tekstu poza nim.
    Gdy użytkownik podaje nazwę: {"action":"delete_product","name":"Koszulka czarna"}
    Gdy użytkownik podaje ID:    {"action":"delete_product","product_id":123}
 
-10. list_sections
-   Kiedy: "jakie sekcje są na stronie X", "pokaż sekcje strony X", "lista sekcji strony X"
-   {"action":"list_sections","page_slug":"slug-strony"}
-
-11. move_section
-   Kiedy: "przenieś sekcję X na górę/dół", "przesuń X przed/za Y na stronie Z"
-   {"action":"move_section","page_slug":"slug","section_label":"nazwa","direction":"top|bottom|before|after","target_label":null}
-
-12. delete_section
-   Kiedy: "usuń sekcję X ze strony Y", "skasuj sekcję X ze strony Y"
-   {"action":"delete_section","page_slug":"slug","section_label":"nazwa"}
-
-13. swap_sections
-   Kiedy: "zamień miejscami sekcję A i B na stronie X"
-   {"action":"swap_sections","page_slug":"slug","label_a":"sekcja-a","label_b":"sekcja-b"}
-
 9. unknown
    Kiedy: polecenie jest niezrozumiałe, zbyt ogólne lub nie dotyczy zarządzania stroną WP.
    {"action":"unknown","reason":"krótkie wyjaśnienie po polsku czego brakuje","suggestion":"co użytkownik powinien doprecyzować}
@@ -924,34 +894,7 @@ async def confirm_action(body: ActionToken, _: bool = Depends(verify_token)):
                     "message":      f"✅ Przeniesiono do kosza: {resource_slug}."
                 }}
 
-        # ── move_section / delete_section / swap_sections ───────────────────
-        elif action in ("move_section", "delete_section", "swap_sections"):
-            page_id    = state["page_id"]
-            page_title = state["page_title"]
-            page_slug  = state["page_slug"]
-            new_content = state["new_content"]
-
-            await _save_state_before_action(http, "pages", page_id, page_title, action)
-
-            r = await http.post(
-                f"{WP_URL}/pages/{page_id}",
-                json={"content": new_content},
-                auth=(WP_USER, WP_APP_PASSWORD),
-                timeout=30.0
-            )
-            if r.status_code not in [200, 201]:
-                raise HTTPException(status_code=502, detail=f"WordPress błąd: {r.status_code}")
-
-            labels = {"move_section": "Sekcja przeniesiona!", "delete_section": "Sekcja usunięta!", "swap_sections": "Sekcje zamienione!"}
-            return {"success": True, "data": {
-                "action":       action,
-                "action_label": labels[action],
-                "message":      f"✅ Operacja wykonana na stronie '{page_slug}'. Możesz cofnąć przez przycisk Cofnij.",
-                "url":          f"/page/{page_slug}",
-                "page_id":      page_id
-            }}
-
-        raise HTTPException(status_code=400, detail=f"Nieznana akcja w pending: {action}")
+    raise HTTPException(status_code=400, detail=f"Nieznana akcja w pending: {action}")
 
 
 # ── ODRZUĆ PODGLĄD ─────────────────────────────────────────────────────────────
@@ -1267,162 +1210,7 @@ async def text_command(
                 "expires_in":    PENDING_EXPIRY_MINUTES * 60
             }}
 
-        # ── list_sections ─────────────────────────────────────────────────────
-        elif action == "list_sections":
-            page_slug = decision.get("page_slug", "")
-            async with httpx.AsyncClient() as http:
-                r = await http.get(
-                    f"{WP_URL}/pages",
-                    params={"slug": page_slug, "context": "edit"},
-                    auth=(WP_USER, WP_APP_PASSWORD),
-                    timeout=30.0
-                )
-            pages = r.json()
-            if not pages:
-                raise HTTPException(status_code=404, detail=f"Nie znaleziono strony: {page_slug}")
-            raw = pages[0]["content"]["raw"]
-            labeled = _add_labels_to_content(raw)
-            if labeled != raw:
-                async with httpx.AsyncClient() as http:
-                    await http.post(
-                        f"{WP_URL}/pages/{pages[0]['id']}",
-                        json={"content": labeled},
-                        auth=(WP_USER, WP_APP_PASSWORD),
-                        timeout=30.0
-                    )
-            sections = _parse_sections(labeled)
-            names = [f"{i+1}. {s['label']}" for i, s in enumerate(sections)]
-            return {"success": True, "data": {
-                "action":       "list_sections",
-                "action_label": "Sekcje strony",
-                "message":      f"Strona '{page_slug}' zawiera {len(sections)} sekcji:\n" + "\n".join(names)
-            }}
-
-        # ── move_section ──────────────────────────────────────────────────────
-        elif action == "move_section":
-            page_slug     = decision.get("page_slug", "")
-            section_label = decision.get("section_label", "")
-            direction     = decision.get("direction", "top")
-            target_label  = decision.get("target_label")
-            async with httpx.AsyncClient() as http:
-                r = await http.get(f"{WP_URL}/pages", params={"slug": page_slug, "context": "edit"}, auth=(WP_USER, WP_APP_PASSWORD), timeout=30.0)
-            pages = r.json()
-            if not pages:
-                raise HTTPException(status_code=404, detail=f"Nie znaleziono strony: {page_slug}")
-            page_id    = pages[0]["id"]
-            page_title = pages[0]["title"]["rendered"]
-            raw        = _add_labels_to_content(pages[0]["content"]["raw"])
-            sections   = _parse_sections(raw)
-            idx = _find_section_idx(sections, section_label)
-            if idx is None:
-                raise HTTPException(status_code=404, detail=f"Nie znaleziono sekcji '{section_label}'")
-            section = sections.pop(idx)
-            if direction == "top":
-                sections.insert(0, section)
-            elif direction == "bottom":
-                sections.append(section)
-            elif direction in ("before", "after") and target_label:
-                t_idx = _find_section_idx(sections, target_label)
-                if t_idx is None:
-                    raise HTTPException(status_code=404, detail=f"Nie znaleziono sekcji docelowej '{target_label}'")
-                sections.insert(t_idx if direction == "before" else t_idx + 1, section)
-            else:
-                sections.append(section)
-            new_content = _rebuild_content(sections)
-            dir_label   = {"top": "na górę", "bottom": "na dół", "before": "przed", "after": "za"}.get(direction, direction)
-            order_list = ", ".join(s["label"] for s in sections)
-            preview_html = f"""<!DOCTYPE html><html lang="pl"><head><meta charset="UTF-8">
-<style>
-body{{margin:0;padding:0;font-family:sans-serif;background:#f9f9f9}}
-.preview-bar{{background:#0369a1;color:#fff;padding:.6rem 1rem;font-size:.82rem;display:flex;align-items:center;gap:.5rem;position:sticky;top:0;z-index:999}}
-.preview-bar strong{{background:#fff;color:#0369a1;border-radius:4px;padding:.1rem .4rem;font-size:.78rem}}
-.preview-content{{padding:1.5rem}}
-</style></head><body>
-<div class="preview-bar">👁 Podgląd po zmianie &nbsp;|&nbsp; kolejność: <strong>{order_list}</strong></div>
-<div class="preview-content">{new_content}</div>
-</body></html>"""
-            token = secrets.token_hex(16)
-            pending_actions[token] = {
-                "action":      "move_section",
-                "page_id":     page_id,
-                "page_title":  page_title,
-                "page_slug":   page_slug,
-                "new_content": new_content,
-                "created_at":  datetime.utcnow()
-            }
-            return {"success": True, "data": {"preview": True, "pending_token": token, 
-                "action":       "move_section",
-                "action_label": "Przenieś sekcję",
-                "message":      f"Bot chce przenieść sekcję '{section_label}' {dir_label} na stronie '{page_slug}'.",
-                "preview_html": preview_html
-            }}
-
-        elif action == "delete_section":
-            page_slug     = decision.get("page_slug", "")
-            section_label = decision.get("section_label", "")
-            async with httpx.AsyncClient() as http:
-                r = await http.get(f"{WP_URL}/pages", params={"slug": page_slug, "context": "edit"}, auth=(WP_USER, WP_APP_PASSWORD), timeout=30.0)
-            pages = r.json()
-            if not pages:
-                raise HTTPException(status_code=404, detail=f"Nie znaleziono strony: {page_slug}")
-            page_id    = pages[0]["id"]
-            page_title = pages[0]["title"]["rendered"]
-            raw        = _add_labels_to_content(pages[0]["content"]["raw"])
-            sections   = _parse_sections(raw)
-            idx = _find_section_idx(sections, section_label)
-            if idx is None:
-                raise HTTPException(status_code=404, detail=f"Nie znaleziono sekcji '{section_label}'")
-            sections_after = [s for i, s in enumerate(sections) if i != idx]
-            new_content    = _rebuild_content(sections_after)
-            preview_html = f"""<div style="font-family:sans-serif;padding:1.5rem;background:#fff5f5;border-radius:12px;border:2px solid #dc2626">
-                <h3 style="margin:0 0 0.5rem;color:#dc2626">🗑️ Usuń sekcję</h3>
-                <p style="margin:0;color:#374151">Sekcja <strong>{section_label}</strong> zostanie <strong>trwale usunięta</strong> ze strony <strong>{page_slug}</strong>.</p>
-                <p style="margin:0.5rem 0 0;color:#6b7280;font-size:0.85rem">Pozostałe sekcje: {", ".join(s["label"] for s in sections_after)}</p>
-            </div>"""
-            token = secrets.token_hex(16)
-            pending_actions[token] = {
-                "action":      "delete_section",
-                "page_id":     page_id,
-                "page_title":  page_title,
-                "page_slug":   page_slug,
-                "new_content": new_content,
-                "created_at":  datetime.utcnow()
-            }
-            return {"success": True, "data": {"preview": True, "pending_token": token, 
-                "action":       "delete_section",
-                "action_label": "Usuń sekcję",
-                "message":      f"Bot chce usunąć sekcję '{section_label}' ze strony '{page_slug}'.",
-                "preview_html": preview_html
-            }}
-
-        # ── swap_sections ─────────────────────────────────────────────────────
-        elif action == "swap_sections":
-            page_slug = decision.get("page_slug", "")
-            label_a   = decision.get("label_a", "")
-            label_b   = decision.get("label_b", "")
-            async with httpx.AsyncClient() as http:
-                r = await http.get(f"{WP_URL}/pages", params={"slug": page_slug, "context": "edit"}, auth=(WP_USER, WP_APP_PASSWORD), timeout=30.0)
-            pages = r.json()
-            if not pages:
-                raise HTTPException(status_code=404, detail=f"Nie znaleziono strony: {page_slug}")
-            page_id  = pages[0]["id"]
-            raw      = _add_labels_to_content(pages[0]["content"]["raw"])
-            sections = _parse_sections(raw)
-            idx_a = _find_section_idx(sections, label_a)
-            idx_b = _find_section_idx(sections, label_b)
-            if idx_a is None:
-                raise HTTPException(status_code=404, detail=f"Nie znaleziono sekcji '{label_a}'")
-            if idx_b is None:
-                raise HTTPException(status_code=404, detail=f"Nie znaleziono sekcji '{label_b}'")
-            sections[idx_a], sections[idx_b] = sections[idx_b], sections[idx_a]
-            async with httpx.AsyncClient() as http:
-                await http.post(f"{WP_URL}/pages/{page_id}", json={"content": _rebuild_content(sections)}, auth=(WP_USER, WP_APP_PASSWORD), timeout=30.0)
-            return {"success": True, "data": {
-                "action": "swap_sections", "action_label": "Sekcje zamienione!",
-                "message": f"✅ Zamieniono '{label_a}' i '{label_b}' na stronie '{page_slug}'."
-            }}
-
-                # ── unknown ───────────────────────────────────────────────────────────
+        # ── unknown ───────────────────────────────────────────────────────────
         elif action == "unknown":
             return {"success": False, "data": {
                 "action":       "unknown",
