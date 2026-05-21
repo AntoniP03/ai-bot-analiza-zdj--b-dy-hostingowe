@@ -690,10 +690,11 @@ i zwracasz WYŁĄCZNIE jeden obiekt JSON - zero tekstu poza nim.
 
 1. create_post
    Kiedy: "napisz post", "opublikuj artykuł", "dodaj wpis na blogu"
-   {"action":"create_post","title":"tytuł","content":"HTML","excerpt":"opis SEO (max 160 znaków)","tags":["tag1","tag2"],"status":"publish lub draft"}
+   {"action":"create_post","title":"tytuł","content":"HTML","excerpt":"opis SEO (max 160 znaków)","tags":["tag1","tag2"],"status":"publish lub draft"} (domyślnie publish)
 
 2. create_page
-   Kiedy: "utwórz stronę", "zrób nową podstronę", "dodaj stronę O nas"
+   Kiedy: "utwórz stronę", "zrób nową podstronę", "dodaj stronę O nas", "dodaj podstronę X", "stwórz podstronę X", "zrób stronę X", "dodaj zakładkę X", "nowa strona X", "dodaj podstronę o nazwie X", "siema dodaj podstronę X"
+   WAŻNE: jeśli polecenie zawiera "dodaj podstronę" lub "dodaj stronę" BEZ słów "sekcję/baner/hero/dopisz" → zawsze create_page, nie append_section!
    {"action":"create_page","title":"tytuł","content":"HTML","excerpt":"opis","parent_slug":"slug-rodzica lub null"}
 
 3. append_section
@@ -717,7 +718,7 @@ i zwracasz WYŁĄCZNIE jeden obiekt JSON - zero tekstu poza nim.
 
 7. create_product
    Kiedy: "dodaj produkt", "utwórz produkt", "stwórz produkt w sklepie"
-   {"action":"create_product","name":"nazwa","regular_price":"29.99","description":"opis","status":"draft"}
+   {"action":"create_product","name":"nazwa","regular_price":"29.99","description":"opis","status":"publish lub draft"} (domyślnie publish)
 
 8. delete_product
    Kiedy: "usuń produkt", "skasuj produkt", "usuń produkt o nazwie X", "usuń produkt ID X"
@@ -749,7 +750,7 @@ i zwracasz WYŁĄCZNIE jeden obiekt JSON - zero tekstu poza nim.
 - Jeśli brak wskazania konkretnej strony + "zaprojektuj/stwórz/zrób" -> design_section
 - Jeśli polecenie zawiera "zmień/edytuj/popraw" -> update_content
 - Jeśli nie jesteś pewien między dwiema akcjami -> wybierz bardziej bezpieczną (nie delete, nie publish)
-- status domyślny dla nowych treści: "draft"
+- status domyślny dla nowych treści: "publish"
 - Slug generuj z tytułu: małe litery, myślniki zamiast spacji, bez polskich znaków
 
 === OBSŁUGA PRZYPADKÓW GRANICZNYCH ===
@@ -1002,7 +1003,7 @@ async def text_command(
                     "title":   decision.get("title", "Nowy post"),
                     "content": decision.get("content", ""),
                     "excerpt": decision.get("excerpt", "")[:160],
-                    "status":  decision.get("status", "draft")
+                    "status":  decision.get("status", "publish")
                 },
                 auth=(WP_USER, WP_APP_PASSWORD),
                 timeout=30.0
@@ -1020,13 +1021,44 @@ async def text_command(
 
         # ── create_page — bez podglądu (tworzy szkic) ─────────────────────────
         elif action == "create_page":
+            # Krok 1: WEBMASTER generuje piękny HTML dla strony
+            page_title   = decision.get("title", "Nowa strona")
+            page_desc    = decision.get("content", "") or decision.get("description", "")
+            design_resp  = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": WEBMASTER_PROMPT},
+                    {"role": "user",   "content": f"""Stwórz PEŁNĄ, PROFESJONALNĄ stronę o tytule: '{page_title}'.
+Opis/zawartość: {page_desc}
+
+WYMAGANIA DESIGNU (obowiązkowe):
+- Bogaty <style> z co najmniej 80 regułami CSS
+- Hero section z gradientem tła, dużym nagłówkiem i animacją fadeIn
+- Karty z box-shadow, border-radius, hover efektami (transform + shadow)
+- Kolory: żółty (#FFD200) i czarny (#1a1a1a) jako główna paleta
+- Google Fonts: Inter lub Poppins (załaduj przez @import)
+- Sekcje z padding min. 60px, max-width 1200px, wycentrowane
+- Przyciski z gradientem, hover efektem i border-radius
+- Animacje: @keyframes fadeInUp dla sekcji przy ładowaniu
+- Responsywność: @media (max-width: 768px)
+- Ikony jako emoji lub unicode w kółkach z background-color
+Zwróć TYLKO czysty HTML bez żadnego markdownu."""}
+                ],
+                max_tokens=3500
+            )
+            page_html = design_resp.choices[0].message.content.strip()
+            if page_html.startswith("```"):
+                page_html = "\n".join(page_html.split("\n")[1:])
+            if page_html.strip().endswith("```"):
+                page_html = "\n".join(page_html.strip().split("\n")[:-1])
+            page_html = page_html.strip()
             r = await http.post(
                 f"{WP_URL}/pages",
                 json={
-                    "title":   decision.get("title", "Nowa strona"),
-                    "content": decision.get("content", ""),
+                    "title":   page_title,
+                    "content": "<!-- wp:html -->" + page_html + "<!-- /wp:html -->",
                     "excerpt": decision.get("excerpt", "")[:160],
-                    "status":  decision.get("status", "draft")
+                    "status":  decision.get("status", "publish")
                 },
                 auth=(WP_USER, WP_APP_PASSWORD),
                 timeout=30.0
@@ -1189,11 +1221,16 @@ async def text_command(
                     {
                         "role": "system",
                         "content": (
-                            "Jesteś edytorem treści WordPress. "
+                            "Jesteś ekspertem od tworzenia pięknych stron WordPress. "
                             "Otrzymasz aktualną treść strony w HTML oraz instrukcję co zmienić. "
-                            "Zwróć TYLKO poprawiony HTML - bez komentarzy, bez markdown, bez wyjaśnień. "
-                            "Zachowaj istniejące bloki Gutenberga jeśli są. "
-                            "Język: polski."
+                            "Zwróć TYLKO poprawiony HTML - bez komentarzy, bez markdown, bez wyjaśnień, bez code fences. "
+                            "Zasady tworzenia layoutów: używaj CSS Grid lub Flexbox do układania kart obok siebie, "
+                            "nigdy nie używaj tabel do layoutu, karty mają mieć równą szerokość w rzędzie. "
+                            "Każda sekcja z kartami musi mieć styl: display:grid; grid-template-columns:repeat(3,1fr); gap:20px; "
+                            "Karty: background:#fff; border-radius:16px; padding:28px 20px; box-shadow:0 2px 12px rgba(0,0,0,0.08); text-align:center; "
+                            "Ikonki emoji w żółtym kółku: width:52px;height:52px;background:#FFD200;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 16px; "
+                            "Zawsze dodaj @media(max-width:768px) z grid-template-columns:1fr dla mobile. "
+                            "Zachowaj istniejące bloki Gutenberga jeśli są. Język: polski."
                         )
                     },
                     {
@@ -1203,7 +1240,14 @@ async def text_command(
                 ],
                 max_tokens=3000
             )
-            new_content = edit_response.choices[0].message.content
+            raw = edit_response.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                lines = raw.split("\n")
+                raw = "\n".join(lines[1:-1]).strip()
+            if "<!-- wp:html -->" not in raw:
+                new_content = f"<!-- wp:html -->\n{raw}\n<!-- /wp:html -->"
+            else:
+                new_content = raw
 
             # Zapisz jako pending — NIE piszemy do WP
             token = str(uuid.uuid4())
@@ -1441,7 +1485,7 @@ body{{margin:0;padding:0;font-family:sans-serif;background:#f9f9f9}}
                         "name":          decision.get("name", "Nowy produkt"),
                         "regular_price": str(decision.get("regular_price", "0")),
                         "description":   decision.get("description", ""),
-                        "status":        decision.get("status", "draft"),
+                        "status":        decision.get("status", "publish"),
                         "type":          "simple"
                     },
                     auth=WC_AUTH,
